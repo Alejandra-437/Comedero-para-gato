@@ -1,4 +1,5 @@
 // ===== Cat Feeder Automatico - ESP32 =====
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WebServer.h>
@@ -8,17 +9,23 @@
 #include <ArduinoJson.h>
 #include "time.h"
 
-#define RESET_KNOP   5
-#define LED_R 10
-#define LED_G 12
-#define LED_B 11
+#define RESET_KNOP   4
+#define LED_R 13
+#define LED_G 14
+#define LED_B 27
 #define SERVO_PIN 18
 
 #define MAX_MOMENTEN 5
-#define SERVO_CENTER 90
+#define SERVO_FEED_US 400   // valor que lo hace girar (mas lejos de 1500 = mas rapido)
+
+#define SIN_WIFI 0
+#define DEBUG_CORE 0
+#define MAX_ARRANQUES 5
+
+RTC_NOINIT_ATTR int arranqueNum = 0;
 
 WebServer server(80);
-WiFiManager wm;                 // GLOBAL: si es local, ~WiFiManager() destruye el portal al salir de setup()
+WiFiManager wm;
 Servo mijnServo;
 Preferences prefs;
 
@@ -35,17 +42,14 @@ bool serverActivo = false;
 bool mdnsActivo  = false;
 int  laatsteMinuut = -1;
 uint32_t wifiCaidoTijd = 0;
+bool guardarYReiniciar = false;
 
-// --- Maquina de estados del servo (NO bloqueante) ---
 enum FeedState { FEED_IDLE, FEED_VOORUIT, FEED_TERUG };
 FeedState feedState = FEED_IDLE;
 uint32_t   feedTijd = 0;
 int        feedStappen = 0;
 int        feedStap = 0;
-int        servoVooruit = SERVO_CENTER;
-int        servoAchteruit = SERVO_CENTER;
 
-// --- Boton de reset (NO bloqueante) ---
 bool     knopIngedrukt = false;
 uint32_t knopTijd = 0;
 bool     resetGedaan = false;
@@ -59,44 +63,23 @@ void setKleur(bool r, bool g, bool b) {
 // ---------- ALIMENTACION (no bloqueante) ----------
 
 void startVoeren() {
-  if (feedState != FEED_IDLE) return;          // ya esta alimentando
+  if (feedState != FEED_IDLE) return;
+  duur = constrain(duur, 1, 10);
 
-  snelheid = constrain(snelheid, 0, 100);
-  duur    = constrain(duur, 1, 10);
-
-  servoVooruit  = SERVO_CENTER - (int)(snelheid * 0.3);
-  servoAchteruit = SERVO_CENTER + (int)(snelheid * 0.3);
-
-  feedStappen = duur * 2;
-  feedStap = 0;
-  feedTijd = millis();
+  mijnServo.attach(SERVO_PIN, 300, 2400);      // rango ampliado
+  mijnServo.writeMicroseconds(SERVO_FEED_US);  // GIRA (al otro lado)
+  feedTijd  = millis();
   feedState = FEED_VOORUIT;
-  mijnServo.write(servoVooruit);
   setKleur(0, 0, 1);
 }
 
 void updateVoeren() {
   if (feedState == FEED_IDLE) return;
 
-  uint32_t nu = millis();
-
-  if (feedState == FEED_VOORUIT) {
-    if (nu - feedTijd < 400) return;
-    mijnServo.write(servoAchteruit);
-    feedState = FEED_TERUG;
-    feedTijd = nu;
-  } else if (feedState == FEED_TERUG) {
-    if (nu - feedTijd < 150) return;
-    feedStap++;
-    if (feedStap >= feedStappen) {
-      mijnServo.write(SERVO_CENTER);
-      feedState = FEED_IDLE;
-      setKleur(1, 0, 1);
-    } else {
-      mijnServo.write(servoVooruit);
-      feedState = FEED_VOORUIT;
-      feedTijd = nu;
-    }
+  if (millis() - feedTijd >= (uint32_t)duur * 1000) {
+    mijnServo.detach();   // corta señal -> PARA
+    feedState = FEED_IDLE;
+    setKleur(1, 0, 1);
   }
 }
 
@@ -111,10 +94,10 @@ void checkResetKnop() {
     return;
   }
 
-  if (!knopIngedrukt) {          // flanco de pulsacion
+  if (!knopIngedrukt) {
     knopIngedrukt = true;
     knopTijd = nu;
-    setKleur(1, 1, 0);           // avisar: manteniendo pulsado
+    setKleur(1, 1, 0);
     return;
   }
 
@@ -128,7 +111,7 @@ void checkResetKnop() {
     prefs.clear();
     prefs.end();
 
-    wm.resetSettings();          // borra las credenciales WiFi de la NVS
+    wm.resetSettings();
     delay(100);
     Serial.println("Reiniciando...");
     ESP.restart();
@@ -139,14 +122,14 @@ void checkResetKnop() {
 
 void checkVoerTijd() {
   static uint32_t laatsteCheck = 0;
-  if (millis() - laatsteCheck < 1000) return;   // comprobar 1 vez por segundo
+  if (millis() - laatsteCheck < 1000) return;
   laatsteCheck = millis();
 
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 100)) return;    // aun sin hora NTP (sin spam)
+  if (!getLocalTime(&timeinfo, 100)) return;
 
   int huidig = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  if (huidig == laatsteMinuut) return;          // ya evaluado este minuto
+  if (huidig == laatsteMinuut) return;
   laatsteMinuut = huidig;
 
   for (int i = 0; i < aantalMomenten; i++) {
@@ -173,185 +156,156 @@ String pagina() {
     tijd = h + ":" + m;
   }
 
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-body {font-family:sans-serif;background:#0f172a;color:white;text-align:center;}
-.card {background:#1e293b;padding:20px;margin:10px;border-radius:15px;}
-button {padding:15px;border-radius:10px;border:none;background:#38bdf8;}
-.row {display:flex;gap:5px;margin:5px;}
-input {flex:1;padding:10px;border-radius:10px;border:none;}
-</style>
-</head>
-<body>
+  String html = "";
+  html += "<!DOCTYPE html>\n";
+  html += "<html>\n";
+  html += "<head>\n";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>\n";
+  html += "<style>\n";
+  html += "body {font-family:sans-serif;background:#0f172a;color:white;text-align:center;}\n";
+  html += ".card {background:#1e293b;padding:20px;margin:10px;border-radius:15px;}\n";
+  html += "button {padding:15px;border-radius:10px;border:none;background:#38bdf8;}\n";
+  html += ".row {display:flex;gap:5px;margin:5px;}\n";
+  html += "input {flex:1;padding:10px;border-radius:10px;border:none;}\n";
+  html += "</style>\n";
+  html += "</head>\n";
+  html += "<body>\n";
+  html += "<h2>SmartCat Feeder</h2>\n";
+  html += "<p>ESP32: <b id='espClock'>" + tijd + "</b> &nbsp; Movil: <span id='clock'>--:--</span></p>\n";
+  html += "<p>IP: <b id='ip'>--</b> &nbsp; <span id='status'>conectando...</span></p>\n";
+  html += "<div class='card'>\n";
+  html += "speed : <span id='speedVal'>0</span>%<br>\n";
+  html += "<input type='range' id='speed' min='0' max='100'>\n";
+  html += "<br><br>\n";
+  html += "duration : <span id='timeVal'>0</span> sec<br>\n";
+  html += "<input type='range' id='time' min='1' max='10'>\n";
+  html += "</div>\n";
+  html += "<div class='card'>\n";
+  html += "feed moments\n";
+  html += "<div id='momenten'></div>\n";
+  html += "<button onclick='addMoment()'> + </button>\n";
+  html += "</div>\n";
+  html += "<div class='card'>\n";
+  html += "<button onclick='feedNow()'> feed </button>\n";
+  html += "</div>\n";
+  html += "<script>\n";
 
-<h2>SmartCat Feeder</h2>
-<p>ESP32: <b id="espClock">)rawliteral" + tijd + R"rawliteral(</b> &nbsp; Movil: <span id="clock">--:--</span></p>
-<p>IP: <b id="ip">--</b> &nbsp; <span id="status">conectando...</span></p>
+  html += "let count = " + String(aantalMomenten) + ";\n";
 
-<div class="card">
-speed : <span id="speedVal">0</span>%<br>
-<input type="range" id="speed" min="0" max="100">
+  html += "function saveAll(){\n";
+  html += "for(let i=0;i<count;i++){\n";
+  html += "let u=document.getElementById('u'+i);\n";
+  html += "let m=document.getElementById('m'+i);\n";
+  html += "if(u&&m){window['u'+i]=u.value;window['m'+i]=m.value;}\n";
+  html += "}\n";
+  html += "}\n";
 
-<br><br>
+  html += "function renderMomenten(){\n";
+  html += "let c=document.getElementById('momenten');\n";
+  html += "c.innerHTML='';\n";
+  html += "for(let i=0;i<count;i++){\n";
+  html += "let d=document.createElement('div');\n";
+  html += "d.className='row';\n";
+  html += "d.innerHTML=`\n";
+  html += "<input type='number' id='u${i}' min='0' max='23' value='${window['u'+i] !== undefined ? window['u'+i] : 0}' onchange='saveMoment(${i})'>\n";
+  html += "<input type='number' id='m${i}' min='0' max='59' value='${window['m'+i] !== undefined ? window['m'+i] : 0}' onchange='saveMoment(${i})'>\n";
+  html += "<button onclick='removeMoment(${i})'> X </button>\n";
+  html += "`;\n";
+  html += "c.appendChild(d);\n";
+  html += "}\n";
+  html += "}\n";
 
-duration : <span id="timeVal">0</span> sec<br>
-<input type="range" id="time" min="1" max="10">
-</div>
+  html += "function addMoment(){\n";
+  html += "saveAll();\n";
+  html += "if(count>=5)return;\n";
+  html += "window['u'+count]=12;\n";
+  html += "window['m'+count]=0;\n";
+  html += "count++;\n";
+  html += "renderMomenten();\n";
+  html += "sendData();\n";
+  html += "}\n";
 
-<div class="card">
-feed moments
-<div id="momenten"></div>
-<button onclick="addMoment()"> + </button>
-</div>
+  html += "function removeMoment(i){\n";
+  html += "saveAll();\n";
+  html += "for(let x=i;x<count-1;x++){\n";
+  html += "window['u'+x]=window['u'+(x+1)];\n";
+  html += "window['m'+x]=window['m'+(x+1)];\n";
+  html += "}\n";
+  html += "count--;\n";
+  html += "renderMomenten();\n";
+  html += "setTimeout(sendData,50);\n";
+  html += "}\n";
 
-<div class="card">
-<button onclick="feedNow()"> feed </button>
-</div>
+  html += "function saveMoment(i){\n";
+  html += "let u=document.getElementById('u'+i);\n";
+  html += "let m=document.getElementById('m'+i);\n";
+  html += "if(u&&m){window['u'+i]=u.value;window['m'+i]=m.value;sendData();}\n";
+  html += "}\n";
 
-<script>
+  html += "function sendData(){\n";
+  html += "let url='/update?';\n";
+  html += "url+='speed='+speed.value;\n";
+  html += "url+='&time='+time.value;\n";
+  html += "url+='&count='+count;\n";
+  html += "for(let i=0;i<count;i++){\n";
+  html += "url+='&u'+i+'='+window['u'+i];\n";
+  html += "url+='&m'+i+'='+window['m'+i];\n";
+  html += "}\n";
+  html += "fetch(url);\n";
+  html += "}\n";
 
-let count = )rawliteral" + String(aantalMomenten) + R"rawliteral(;
+  html += "function feedNow(){fetch('/api/feed').then(()=>{document.getElementById('status').innerText='Alimentando...';});}\n";
 
-function saveAll(){
-for(let i=0;i<count;i++){
-  let u=document.getElementById("u"+i);
-  let m=document.getElementById("m"+i);
-  if(u&&m){
-    window['u'+i]=u.value;
-    window['m'+i]=m.value;
-  }
-}
-}
+  html += "let speed=document.getElementById('speed');\n";
+  html += "let time=document.getElementById('time');\n";
+  html += "let speedVal=document.getElementById('speedVal');\n";
+  html += "let timeVal=document.getElementById('timeVal');\n";
+  html += "function updateLabels(){speedVal.innerText=speed.value;timeVal.innerText=time.value;}\n";
+  html += "speed.oninput = function(){ updateLabels(); }\n";
+  html += "speed.onchange = function(){ updateLabels(); sendData(); }\n";
+  html += "time.oninput = function(){ updateLabels(); }\n";
+  html += "time.onchange = function(){ updateLabels(); sendData(); }\n";
 
-function renderMomenten(){
-let c=document.getElementById("momenten");
-c.innerHTML="";
-for(let i=0;i<count;i++){
-let d=document.createElement("div");
-d.className="row";
-d.innerHTML=`
-<input type="number" id="u${i}" min="0" max="23" value="${window['u'+i] !== undefined ? window['u'+i] : 0}" onchange="saveMoment(${i})">
-<input type="number" id="m${i}" min="0" max="59" value="${window['m'+i] !== undefined ? window['m'+i] : 0}" onchange="saveMoment(${i})">
-<button onclick="removeMoment(${i})"> X </button>
-`;
-c.appendChild(d);
-}
-}
-
-function addMoment(){
-saveAll();
-if(count>=5)return;
-window['u'+count]=12;
-window['m'+count]=0;
-count++;
-renderMomenten();
-sendData();
-}
-
-function removeMoment(i){
-saveAll();
-for(let x=i;x<count-1;x++){
-window['u'+x]=window['u'+(x+1)];
-window['m'+x]=window['m'+(x+1)];
-}
-count--;
-renderMomenten();
-setTimeout(sendData,50);
-}
-
-function saveMoment(i){
-let u=document.getElementById("u"+i);
-let m=document.getElementById("m"+i);
-if(u&&m){
-window['u'+i]=u.value;
-window['m'+i]=m.value;
-sendData();
-}
-}
-
-function sendData(){
-let url="/update?";
-url+="speed="+speed.value;
-url+="&time="+time.value;
-url+="&count="+count;
-for(let i=0;i<count;i++){
-url+="&u"+i+"="+window['u'+i];
-url+="&m"+i+"="+window['m'+i];
-}
-fetch(url);
-}
-
-function feedNow(){fetch("/api/feed").then(()=>{document.getElementById("status").innerText="Alimentando...";});}
-
-let speed=document.getElementById("speed");
-let time=document.getElementById("time");
-
-let speedVal=document.getElementById("speedVal");
-let timeVal=document.getElementById("timeVal");
-
-function updateLabels(){
-  speedVal.innerText = speed.value;
-  timeVal.innerText = time.value;
-}
-
-// oninput solo actualiza la etiqueta; onchange (al soltar) guarda -> sin tormenta de escrituras en NVS
-speed.oninput = function(){ updateLabels(); }
-speed.onchange = function(){ updateLabels(); sendData(); }
-
-time.oninput = function(){ updateLabels(); }
-time.onchange = function(){ updateLabels(); sendData(); }
-
-window.onload=function(){
-speed.value=)rawliteral" + String(snelheid) + R"rawliteral(;
-time.value=)rawliteral" + String(duur) + R"rawliteral(;
-
-updateLabels();
-
-)rawliteral";
+  html += "window.onload=function(){\n";
+  html += "speed.value=" + String(snelheid) + ";\n";
+  html += "time.value=" + String(duur) + ";\n";
+  html += "updateLabels();\n";
 
   for (int i = 0; i < aantalMomenten; i++) {
     html += "window['u" + String(i) + "']=" + String(voerUur[i]) + ";";
     html += "window['m" + String(i) + "']=" + String(voerMin[i]) + ";";
   }
 
-  html += R"rawliteral(
+  html += "\n";
+  html += "updateClock();\n";
+  html += "renderMomenten();\n";
+  html += "pollState();\n";
+  html += "}\n";
 
-updateClock();
-renderMomenten();
-pollState();
-}
+  html += "function updateClock(){\n";
+  html += "let now=new Date();\n";
+  html += "let h=now.getHours().toString().padStart(2,'0');\n";
+  html += "let m=now.getMinutes().toString().padStart(2,'0');\n";
+  html += "document.getElementById('clock').innerText=h+':'+m;\n";
+  html += "}\n";
 
-function updateClock(){
-  let now = new Date();
-  let h = now.getHours().toString().padStart(2,'0');
-  let m = now.getMinutes().toString().padStart(2,'0');
-  document.getElementById("clock").innerText = h + ":" + m;
-}
+  html += "async function pollState(){\n";
+  html += "try{\n";
+  html += "const r=await fetch('/api/state',{cache:'no-store'});\n";
+  html += "const s=await r.json();\n";
+  html += "document.getElementById('espClock').innerText=s.hora;\n";
+  html += "document.getElementById('ip').innerText=s.ip;\n";
+  html += "document.getElementById('status').innerText=s.alimentando ? 'Alimentando...' : ('Proximo: '+s.proximo);\n";
+  html += "}catch(e){\n";
+  html += "document.getElementById('status').innerText='sin conexion con el ESP32';\n";
+  html += "}\n";
+  html += "}\n";
 
-// Estado real del ESP32 (su hora es la que manda en el horario)
-async function pollState(){
-  try{
-    const r = await fetch("/api/state",{cache:"no-store"});
-    const s = await r.json();
-    document.getElementById("espClock").innerText = s.hora;
-    document.getElementById("ip").innerText = s.ip;
-    document.getElementById("status").innerText = s.alimentando ? "Alimentando..." : ("Proximo: " + s.proximo);
-  }catch(e){
-    document.getElementById("status").innerText = "sin conexion con el ESP32";
-  }
-}
-
-setInterval(updateClock,1000);
-setInterval(pollState,2000);
-</script>
-
-</body>
-</html>
-)rawliteral";
+  html += "setInterval(updateClock,1000);\n";
+  html += "setInterval(pollState,2000);\n";
+  html += "</script>\n";
+  html += "</body>\n";
+  html += "</html>\n";
 
   return html;
 }
@@ -415,7 +369,7 @@ void handleFeed() {
   server.send(200, "text/plain", "OK");
 }
 
-// ---------- API JSON (contrato estable para cuando elijas la app) ----------
+// ---------- API JSON ----------
 
 String dosDigitos(int v) {
   String s = "";
@@ -435,7 +389,6 @@ String estadoJson() {
     ahora = timeinfo.tm_hour * 60 + timeinfo.tm_min;
   }
 
-  // proximo horario programado
   String proximo = "--";
   if (ahora >= 0) {
     int mejorDiff = 24 * 60 + 1;
@@ -482,19 +435,53 @@ void handleApiFeed() {
 
 // ---------- SETUP / LOOP ----------
 
+void cp(const String& msg) {
+  Serial.println(msg);
+  Serial.flush();
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(300);
+#if DEBUG_CORE
+  Serial.setDebugOutput(true);
+#endif
+
+  if (arranqueNum < 0 || arranqueNum > 1000) arranqueNum = 0;
+  arranqueNum++;
+  bool modoSeguro = (arranqueNum > MAX_ARRANQUES);
+
+  Serial.println();
+  cp("[1] setup - arranque");
+  Serial.print("    arranque nro: "); Serial.println(arranqueNum); Serial.flush();
+  Serial.print("    motivo del reinicio previo: ");
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   Serial.println("POWERON (encendido/reset de pin)"); break;
+    case ESP_RST_EXT:       Serial.println("EXT (pin RESET)"); break;
+    case ESP_RST_SW:        Serial.println("SW (ESP.restart)"); break;
+    case ESP_RST_PANIC:     Serial.println("PANIC (error de codigo)"); break;
+    case ESP_RST_INT_WDT:   Serial.println("INT_WDT (watchdog de un task: WiFi o flash)"); break;
+    case ESP_RST_TASK_WDT:  Serial.println("TASK_WDT (watchdog de un task)"); break;
+    case ESP_RST_WDT:       Serial.println("WDT"); break;
+    case ESP_RST_BROWNOUT:  Serial.println("BROWNOUT (falta de alimentacion)"); break;
+    default:                Serial.println("otro"); break;
+  }
+  Serial.flush();
+  if (modoSeguro) cp("    !! MODO SEGURO: demasiados reinicios, se desactiva el WiFi");
 
   pinMode(RESET_KNOP, INPUT_PULLUP);
+  cp("[2a] pin boton ok");
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
+  cp("[2b] pines led ok");
   setKleur(1, 1, 0);
+  cp("[2c] leds ok");
 
-  // Servo: en ESP32 clasico ESP32Servo usa LEDC con frecuencia fija, no hace falta allocateTimer
   mijnServo.setPeriodHertz(50);
-  mijnServo.attach(SERVO_PIN);
+  mijnServo.attach(SERVO_PIN, 300, 2400);
+  mijnServo.detach();                 // sin señal = servo quieto al arrancar
+  cp("[3] servo ok (pin 18)");
 
   prefs.begin("settings", true);
   snelheid = constrain(prefs.getInt("speed", 30), 0, 100);
@@ -505,36 +492,68 @@ void setup() {
     voerMin[i] = constrain(prefs.getInt(("m" + String(i)).c_str(), 0), 0, 59);
   }
   prefs.end();
+  cp("[4] ajustes leidos de la NVS");
 
-  // Zona horaria ANTES de configTime (si no, el SNTP puede aplicar la zona equivocada)
   setenv("TZ", "CET-1CEST,M3.5.0/02,M10.5.0/03", 1);
   tzset();
+  cp("[5] zona horaria ok");
+
+#if SIN_WIFI
+  cp("[6] MODO DIAGNOSTICO: se salta el WiFi por completo");
+#else
+  bool conectado = false;
+
+  if (modoSeguro) {
+    cp("[6] MODO SEGURO: se salta el auto-connect, se levanta el portal");
+  } else {
+    cp("[6a] WiFi: modo STA, connectando con la red guardada...");
+    WiFi.setSleep(false);
+    WiFi.setAutoReconnect(true);
+    wm.setEnableConfigPortal(false);
+    wm.setConnectTimeout(20);
+
+    conectado = wm.autoConnect(apName);
+    cp(conectado ? "[6b] WiFi CONECTADO" : "[6c] no hay ninguna red guardada");
+  }
+
+  if (!conectado) {
+    cp("[6d] levantando el portal (AP CatFeeder)...");
+    wm.setEnableConfigPortal(true);
+    wm.setConfigPortalBlocking(false);
+
+    wm.setSaveConfigCallback([]() {
+      guardarYReiniciar = true;
+    });
+
+    wm.startConfigPortal(apName);
+    cp("[6e] portal activo");
+  }
+
+  if (conectado) {
+    Serial.print("    IP: "); Serial.println(WiFi.localIP().toString()); Serial.flush();
+  }
+
+  cp("[7] iniciando NTP...");
   configTime(0, 0, ntpServer);
+  cp("[8] NTP configurado (sincroniza en segundo plano)");
 
-  // Portal NO bloqueante: el bucle sigue vivo -> el watchdog del task WiFi no salta
-  wm.setConfigPortalBlocking(false);
-  wm.setConnectTimeout(20);
-
-  if (wm.autoConnect(apName)) {
-    Serial.println();
-    Serial.println("==========================================");
-    Serial.println("  CAT FEEDER - listo");
+  Serial.println();
+  Serial.println("==========================================");
+  Serial.println("  CAT FEEDER - listo");
+  if (conectado) {
     Serial.print("  Panel (esta misma red): http://");
     Serial.println(WiFi.localIP().toString());
     Serial.println("  Panel (por nombre)   : http://kattenvoer.local");
     Serial.println("  -> En el movil: que este en ESTA misma WiFi");
-    Serial.println("==========================================");
-    Serial.println();
   } else {
-    Serial.println();
-    Serial.println("==========================================");
-    Serial.println("  CAT FEEDER - sin WiFi configurado");
     Serial.println("  1) Conecta el movil a la AP 'CatFeeder'");
     Serial.println("  2) Se abrira el portal: elige tu red y contrasena");
-    Serial.println("  3) Reinicia el ESP32");
-    Serial.println("==========================================");
-    Serial.println();
+    Serial.println("  3) El ESP32 se reinicia solo al guardar");
   }
+  Serial.println("==========================================");
+  Serial.println();
+  Serial.flush();
+#endif
 
   setKleur(1, 0, 1);
 
@@ -543,12 +562,22 @@ void setup() {
   server.on("/feed", handleFeed);
   server.on("/api/state", handleApiState);
   server.on("/api/feed", handleApiFeed);
+
+  cp("[10] setup terminado");
+
+  arranqueNum = 0;
 }
 
 void loop() {
-  wm.process();                 // atiende el portal si esta activo
+  wm.process();
 
-  // El servidor propio se arranca solo cuando hay WiFi, para no pelear el puerto 80 con el portal
+  if (guardarYReiniciar) {
+    guardarYReiniciar = false;
+    cp("[*] red guardada, reiniciando...");
+    delay(1500);
+    ESP.restart();
+  }
+
   if (!serverActivo && WiFi.status() == WL_CONNECTED) {
     server.begin();
     serverActivo = true;
@@ -561,8 +590,6 @@ void loop() {
     }
   }
 
-  // Vigilancia del WiFi: si se cae, reconectar; si no vuelve, reinicio limpio
-  // (reboot en vez de arrancar el portal a mitad de sesion, para no pelear el puerto 80)
   if (serverActivo && WiFi.status() != WL_CONNECTED) {
     if (wifiCaidoTijd == 0) {
       wifiCaidoTijd = millis();
