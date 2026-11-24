@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:background="#F8F9FA"
+    android:padding="10dp"
+    android:layout_marginTop="8dp">
+
+    <TextView
+        android:id="@+id/tvLogTipo"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Dispensación"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="#1565C0" />
+
+    <TextView
+        android:id="@+id/tvLogDetalle"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="50g servidos"
+        android:textSize="15sp"
+        android:textColor="#1A1C1E"
+        android:layout_marginTop="2dp" />
+
+    <TextView
+        android:id="@+id/tvLogFecha"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="2026-11-19 08:00:05"
+        android:textSize="12sp"
+        android:textColor="#6C757D"
+        android:layout_marginTop="2dp" />
+</LinearLayout>
