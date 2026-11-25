@@ -1,70 +1,83 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <ESP32Servo.h>
 #include "HX711.h"
+#include "time.h"
 
 // ==========================================
-// 1. PINES Y CONFIGURACIÓN
+// 1. CONFIGURACIÓN WI-FI Y FIREBASE
+// ==========================================
+const char* ssid = "TU_NOMBRE_WIFI";
+const char* password = "TU_CONTRASEÑA_WIFI";
+const String firebaseUrl = "https://test-9d590-default-rtdb.firebaseio.com"; // SIN / al final
+
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = -6 * 3600; // GMT-6 El Salvador
+const int daylightOffset_sec = 0;
+
+// ==========================================
+// 2. PINES Y CONFIGURACIÓN DE HARDWARE
 // ==========================================
 #define DT_PIN        16
 #define SCK_PIN       17
 #define SERVO_PIN     18
 
 #define SERVO_FEED_US  400    // Pulso de giro de tu servo
-#define TIMEOUT_MS     15000  // Seguridad: detiene el servo tras 15 s si no alcanza el peso
+#define TIMEOUT_MS     15000  // Seguridad: detiene el servo tras 15 s
 
-// Ajustes de la balanza
 float factorCalibracion = 467.1;
-const float ZONA_MUERTA = 1.5; // Convierte a 0.0 g el ruido y la deriva dentro de -1.5 g a +1.5 g
+const float ZONA_MUERTA = 1.5;
 
 HX711 balanza;
 Servo servoDispensador;
 
+// Variables de control de dispensación
 bool dispensando = false;
 float pesoInicial = 0.0;
 float pesoObjetivo = 0.0;
+String origenDispensa = "Manual";
 unsigned long inicioDispensa = 0;
-unsigned long ultimaImpresion = 0;
+
+// Temporizadores
+unsigned long ultimoChequeoManual = 0;
+unsigned long ultimoChequeoHorarios = 0;
+unsigned long ultimoEnvioPeso = 0;
+String ultimoMinutoDispensado = "";
 
 // ==========================================
-// 2. LECTURA LIMPIA DE LA BALANZA
+// 3. LECTURA LIMPIA DE LA BALANZA
 // ==========================================
 float leerPeso(int muestras) {
   float peso = balanza.get_units(muestras);
-
-  // Solo convierte a 0.0 el ruido/deriva pequeña entre -ZONA_MUERTA y +ZONA_MUERTA
-  if (fabs(peso) < ZONA_MUERTA) {
-    return 0.0f;
-  }
-
+  if (fabs(peso) < ZONA_MUERTA) return 0.0f;
   return peso;
 }
 
 // ==========================================
-// 3. CONTROL DEL SERVO (POR PESO AGREGADO)
+// 4. CONTROL DEL SERVO + REGISTRO EN FIREBASE
 // ==========================================
-void iniciarDispensa(float gramosPorServir) {
-  if (gramosPorServir <= 0) {
-    Serial.println("Ingresa un peso mayor a 0 g.");
-    return;
-  }
+void iniciarDispensa(float gramosPorServir, String origen) {
+  if (gramosPorServir <= 0 || dispensando) return;
 
-  // Guarda el peso real actual (sin zona muerta) para cancelar cualquier deriva de cero
   pesoInicial = balanza.get_units(5);
   pesoObjetivo = gramosPorServir;
+  origenDispensa = origen;
   dispensando = true;
   inicioDispensa = millis();
 
   servoDispensador.attach(SERVO_PIN, 300, 2400);
   servoDispensador.writeMicroseconds(SERVO_FEED_US);
-  Serial.printf(">> DISPENSANDO +%.1f g (base actual: %.1f g)...\n", pesoObjetivo, pesoInicial);
+  Serial.printf(">> DISPENSANDO +%.1f g [%s] (base: %.1f g)...\n", pesoObjetivo, origen.c_str(), pesoInicial);
 }
 
-void detenerServo(const char* motivo) {
-  servoDispensador.detach(); // Corta la señal PWM -> freno inmediato
+void detenerServo(const char* motivo, bool esTimeout = false) {
+  servoDispensador.detach();
   dispensando = false;
   Serial.printf(">> DETENIDO: %s\n", motivo);
 
-  delay(400); // Pausa breve para estabilizar el plato tras detener el motor
+  delay(400);
   float pesoFinalCrudo = balanza.get_units(10);
   float pesoAgregado = pesoFinalCrudo - pesoInicial;
 
@@ -72,61 +85,103 @@ void detenerServo(const char* motivo) {
   float pesoTotalLimpio = (fabs(pesoFinalCrudo) < ZONA_MUERTA) ? 0.0f : pesoFinalCrudo;
 
   Serial.printf("   Agregado real: %.1f g | Total en plato: %.1f g\n\n", pesoAgregado, pesoTotalLimpio);
-}
 
-// ==========================================
-// 4. COMANDOS POR MONITOR SERIE
-// ==========================================
-void leerComandosSerie() {
-  if (!Serial.available()) return;
+  // Actualizar peso real en Firebase
+  enviarDatoPUT("/dispositivo/peso_actual_plato.json", String((int)round(pesoTotalLimpio)));
 
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  if (cmd.length() == 0) return;
-
-  // 's' -> Parada de emergencia
-  if (cmd.equalsIgnoreCase("s")) {
-    if (dispensando) detenerServo("Parada manual por usuario");
-    else Serial.println("El servo ya esta detenido.");
-    return;
-  }
-
-  // 't' -> Hacer tara (cero)
-  if (cmd.equalsIgnoreCase("t")) {
-    if (dispensando) detenerServo("Interrumpido para tara");
-    Serial.println("Haciendo tara (sin peso en el plato)...");
-    balanza.tare(20);
-    Serial.println("Cero listo.\n");
-    return;
-  }
-
-  // 'c 100' -> Calibrar colocando un peso conocido (usa lectura cruda sin zona muerta)
-  if (cmd.startsWith("c") || cmd.startsWith("C")) {
-    if (dispensando) detenerServo("Interrumpido para calibracion");
-    float pesoConocido = cmd.substring(1).toFloat();
-    if (pesoConocido <= 0) {
-      Serial.println("Formato invalido. Ejemplo para calibrar con 100 g: c 100");
-      return;
-    }
-    double lecturaNeta = balanza.get_value(15);
-    factorCalibracion = lecturaNeta / pesoConocido;
-    balanza.set_scale(factorCalibracion);
-    Serial.printf("Calibrado! Tu factorCalibracion = %.3f\n", factorCalibracion);
-    Serial.printf("Comprobacion -> Peso actual: %.1f g\n\n", leerPeso(10));
-    return;
-  }
-
-  // Si es un numero (ej. '50'), dispensa esa cantidad de gramos adicionales
-  float gramos = cmd.toFloat();
-  if (gramos > 0) {
-    iniciarDispensa(gramos);
+  if (esTimeout) {
+    enviarDatoPUT("/dispositivo/tolva_baja.json", "true");
   } else {
-    Serial.println("Comando no reconocido. Usa: [t], [c <gramos>], [<gramos>] o [s]");
+    enviarDatoPUT("/dispositivo/tolva_baja.json", "false");
+    
+    String fecha = obtenerFechaCompleta();
+    String detalle = String((int)round(pesoAgregado)) + "g servidos (" + origenDispensa + ")";
+    String logJson = "{\"tipo\":\"dispensacion\",\"detalle\":\"" + detalle + "\",\"timestamp\":\"" + fecha + "\"}";
+    enviarDatoPOST("/logs.json", logJson);
   }
 }
 
 // ==========================================
-// 5. SETUP Y LOOP
+// 5. COMUNICACIÓN CON FIREBASE
+// ==========================================
+void revisarOrdenDispensar() {
+  String estado = leerDatoGET("/dispositivo/dispensar_ahora.json");
+  if (estado == "true") {
+    enviarDatoPUT("/dispositivo/dispensar_ahora.json", "false");
+    iniciarDispensa(50.0, "App Manual");
+  }
+}
+
+void comprobarHorarios() {
+  String horaActual = obtenerHoraMinuto();
+  if (horaActual == "" || horaActual == ultimoMinutoDispensado) return;
+
+  String jsonRutinas = leerDatoGET("/rutinas.json");
+  if (jsonRutinas == "" || jsonRutinas == "null") return;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, jsonRutinas)) return;
+
+  for (JsonPair kv : doc.as<JsonObject>()) {
+    JsonObject rutina = kv.value().as<JsonObject>();
+    bool activa = rutina["activa"] | false;
+    String horaProgramada = rutina["hora"] | "";
+    float gramos = rutina["gramos"] | 0.0;
+
+    if (activa && horaProgramada == horaActual && gramos > 0) {
+      ultimoMinutoDispensado = horaActual;
+      iniciarDispensa(gramos, "Rutina " + horaActual);
+      break;
+    }
+  }
+}
+
+String leerDatoGET(String ruta) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  HTTPClient http;
+  http.begin(firebaseUrl + ruta);
+  int httpCode = http.GET();
+  String payload = (httpCode > 0) ? http.getString() : "";
+  http.end();
+  return payload;
+}
+
+void enviarDatoPUT(String ruta, String valorJson) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(firebaseUrl + ruta);
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(valorJson);
+  http.end();
+}
+
+void enviarDatoPOST(String ruta, String valorJson) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(firebaseUrl + ruta);
+  http.addHeader("Content-Type", "application/json");
+  http.POST(valorJson);
+  http.end();
+}
+
+String obtenerHoraMinuto() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "";
+  char buffer[6];
+  strftime(buffer, sizeof(buffer), "%H:%M", &timeinfo);
+  return String(buffer);
+}
+
+String obtenerFechaCompleta() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "2026-11-24 00:00:00";
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+// ==========================================
+// 6. SETUP Y LOOP
 // ==========================================
 void setup() {
   Serial.begin(115200);
@@ -145,19 +200,25 @@ void setup() {
   balanza.set_scale(factorCalibracion);
   balanza.tare(20);
 
-  Serial.println("\n=== PRUEBA HX711 + SERVO LISTA ===");
-  Serial.println("Comandos en Monitor Serie (115200 baud):");
-  Serial.println("  t         -> Poner en cero (tara)");
-  Serial.println("  c 100     -> Calibrar (pon primero un objeto de 100 g)");
-  Serial.println("  50        -> Dispensar 50 g adicionales");
-  Serial.println("  s         -> Parada de emergencia del servo\n");
+  // Conectar Wi-Fi
+  Serial.print("Conectando a Wi-Fi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n¡Wi-Fi conectado!");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  enviarDatoPUT("/dispositivo/estado_wifi.json", "true");
+  enviarDatoPUT("/dispositivo/peso_actual_plato.json", "0");
+
+  Serial.println("\n=== SISTEMA COMPLETO LISTO (HX711 + SERVO + FIREBASE) ===\n");
 }
 
 void loop() {
-  leerComandosSerie();
-
   if (dispensando) {
-    // Usar solo 2 muestras mientras dispensa (~200 ms) para frenar a tiempo
+    // MODO DISPENSACIÓN: máxima prioridad a la balanza (sin peticiones HTTP)
     if (balanza.is_ready()) {
       float pesoAgregado = balanza.get_units(2) - pesoInicial;
       float pesoMostrar = (fabs(pesoAgregado) < ZONA_MUERTA) ? 0.0f : pesoAgregado;
@@ -165,21 +226,31 @@ void loop() {
       Serial.printf("Sirviendo... +%.1f / %.1f g\n", pesoMostrar, pesoObjetivo);
 
       if (pesoAgregado >= pesoObjetivo) {
-        detenerServo("Peso objetivo alcanzado");
+        detenerServo("Peso objetivo alcanzado", false);
       }
     }
 
-    // Proteccion contra tolva vacia o atasco
     if (dispensando && (millis() - inicioDispensa >= TIMEOUT_MS)) {
-      detenerServo("Timeout de seguridad (posible tolva vacia o atasco)");
+      detenerServo("Timeout de seguridad (posible tolva vacia o atasco)", true);
     }
   } else {
-    // En reposo: mostrar peso cada 1 segundo
-    if (millis() - ultimaImpresion >= 1000) {
-      ultimaImpresion = millis();
+    // MODO REPOSO: escuchar Firebase y actualizar peso
+    if (millis() - ultimoChequeoManual > 3000) {
+      ultimoChequeoManual = millis();
+      revisarOrdenDispensar();
+    }
+
+    if (millis() - ultimoChequeoHorarios > 10000) {
+      ultimoChequeoHorarios = millis();
+      comprobarHorarios();
+    }
+
+    if (millis() - ultimoEnvioPeso > 5000) {
+      ultimoEnvioPeso = millis();
       if (balanza.is_ready()) {
         float peso = leerPeso(5);
         Serial.printf("Peso actual: %.1f g\n", peso);
+        enviarDatoPUT("/dispositivo/peso_actual_plato.json", String((int)round(peso)));
       }
     }
   }

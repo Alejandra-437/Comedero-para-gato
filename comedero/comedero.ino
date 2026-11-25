@@ -1,611 +1,829 @@
-// ===== Cat Feeder Automatico - ESP32 =====
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiManager.h>
-#include <WebServer.h>
-#include <ESP32Servo.h>
-#include <Preferences.h>
-#include <ESPmDNS.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <ESP32Servo.h>
+#include "HX711.h"
 #include "time.h"
 
-#define RESET_KNOP   4
-#define LED_R 13
-#define LED_G 14
-#define LED_B 27
-#define SERVO_PIN 18
-
-#define MAX_MOMENTEN 5
-#define SERVO_FEED_US 400   // valor que lo hace girar (mas lejos de 1500 = mas rapido)
-
-#define SIN_WIFI 0
-#define DEBUG_CORE 0
-#define MAX_ARRANQUES 5
-
-RTC_NOINIT_ATTR int arranqueNum = 0;
-
-WebServer server(80);
-WiFiManager wm;
-Servo mijnServo;
-Preferences prefs;
+// ==========================================
+// 1. CONFIGURACIÓN WI-FI, FIREBASE Y RELOJ
+// ==========================================
+const char* ssid = "TU_NOMBRE_WIFI";
+const char* password = "TU_CONTRASEÑA_WIFI";
+const String firebaseUrl = "https://tu-proyecto-default-rtdb.firebaseio.com"; // SIN / al final
 
 const char* ntpServer = "pool.ntp.org";
-const char* apName    = "CatFeeder";
+const long gmtOffset_sec = -6 * 3600; // GMT-6 El Salvador
+const int daylightOffset_sec = 0;
 
-int snelheid = 30;
-int duur = 2;
-int voerUur[MAX_MOMENTEN];
-int voerMin[MAX_MOMENTEN];
-int aantalMomenten = 2;
+// ==========================================
+// 2. DEFINICIÓN DE PINES Y PARÁMETROS HARDWARE
+// ==========================================
+// --- Balanza HX711 ---
+#define DT_PIN                16
+#define SCK_PIN               17
 
-bool serverActivo = false;
-bool mdnsActivo  = false;
-int  laatsteMinuut = -1;
-uint32_t wifiCaidoTijd = 0;
-bool guardarYReiniciar = false;
+// --- Servo Dispensador (360° rotación continua) ---
+// GPIO 25 (libre de conflicto con SPI SCK = 18)
+#define SERVO_DISPENSADOR_PIN 25
+#define SERVO_FEED_US         400
+#define SERVO_REV_US          2500
 
-enum FeedState { FEED_IDLE, FEED_VOORUIT, FEED_TERUG };
-FeedState feedState = FEED_IDLE;
-uint32_t   feedTijd = 0;
-int        feedStappen = 0;
-int        feedStap = 0;
+// --- Lector RFID / NFC (SPI: SCK=18, MISO=19, MOSI=23) ---
+#define RFID_SS_PIN           5
+#define RFID_RST_PIN          22
 
-bool     knopIngedrukt = false;
-uint32_t knopTijd = 0;
-bool     resetGedaan = false;
+// --- Servos de Compuertas (SG92R derecha e izquierda) ---
+#define SERVO_TAPA_R_PIN      13
+#define SERVO_TAPA_L_PIN      14
 
-void setKleur(bool r, bool g, bool b) {
-  digitalWrite(LED_R, r ? LOW : HIGH);
-  digitalWrite(LED_G, g ? LOW : HIGH);
-  digitalWrite(LED_B, b ? LOW : HIGH);
+// --- Ángulos y temporización de compuertas ---
+const int ANGULO_CERRADO_R                     = 90;
+const int ANGULO_ABIERTO_R                     = 10;
+const int ANGULO_CERRADO_L                     = 10;
+const int ANGULO_ABIERTO_L                     = 100;
+const unsigned long MARGEN_APERTURA_COMPUERTA  = 1000;
+const unsigned long TIEMPO_CIERRE_MS           = 1500;
+const unsigned long INTERVALO_LECTURA_RFID_MS  = 100;
+
+// --- UID del tag autorizado (REEMPLAZA por el UID real del collar) ---
+const byte UID_AUTORIZADO_LEN                  = 4;
+const byte UID_AUTORIZADO[UID_AUTORIZADO_LEN]  = { 0xDE, 0xAD, 0xBE, 0xEF };
+
+// --- Protecciones de seguridad y detección de atasco ---
+const unsigned long TIMEOUT_GLOBAL_MS          = 60000;
+const unsigned long TIMEOUT_ARRANQUE_MS        = 2200;
+const unsigned long TIMEOUT_SIN_FLUJO_MS       = 2200;
+const float MIN_AVANCE_RAPIDO_G                = 1.0;
+const float MIN_AVANCE_FINO_G                  = 0.3;
+const float AVANCE_RESET_DESATASCO_G           = 4.0;
+const int   MAX_PULSOS_SIN_AVANCE              = 3;
+const int   MAX_INTENTOS_DESATASCO             = 3;
+
+// --- Tiempos de pre-reversa y desatasco progresivo ---
+const unsigned long DURACION_PRE_REVERSA_MS    = 550;
+const unsigned long PAUSA_PRE_ARRANQUE_MS      = 250;
+const unsigned long PAUSA_PRE_REVERSA_MS       = 800;
+const unsigned long REVERSA_BASE_MS            = 750;
+const unsigned long INCREMENTO_REVERSA_MS      = 200;
+const unsigned long EXTRA_EMPUJE_RECUP_MS      = 250;
+const unsigned long MAX_EMPUJE_RECUP_MS        = 1200;
+const unsigned long PAUSA_POST_REVERSA_MS      = 350;
+
+// --- Balanza y umbrales de dosificación ---
+float factorCalibracion                        = 467.1;
+const float ZONA_MUERTA_PLATO                  = 1.5;
+const float ZONA_MUERTA_AVANCE                 = 0.4;
+const float MARGEN_FRENADO_G                   = 12.5;
+const float TOLERANCIA_FINAL_G                 = 0.8;
+
+// --- Pulsos adaptativos en fase fina ---
+const unsigned long PULSO_MUY_LARGO_MS         = 650;
+const unsigned long PULSO_LARGO_MS             = 480;
+const unsigned long PULSO_MEDIO_MS             = 350;
+const unsigned long PULSO_CORTO_MS             = 240;
+const unsigned long EXTRA_POR_FALLO_MS         = 120;
+const unsigned long PULSO_MAX_MS               = 850;
+const unsigned long PAUSA_ASENTAMIENTO_MS      = 650;
+
+// ==========================================
+// 3. OBJETOS Y VARIABLES DE ESTADO
+// ==========================================
+HX711 balanza;
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+Servo servoDispensador;
+Servo servoTapaR;
+Servo servoTapaL;
+
+enum EstadoDispensa {
+  ESTADO_INACTIVO,
+  ESTADO_ABRIENDO_COMPUERTA,
+  ESTADO_PRE_REVERSA,
+  ESTADO_PRE_PAUSA,
+  ESTADO_RAPIDO,
+  ESTADO_PULSO,
+  ESTADO_ESPERA,
+  ESTADO_DESATASCO_FRENO,
+  ESTADO_DESATASCO_REV,
+  ESTADO_DESATASCO_PAUSA
+};
+
+EstadoDispensa estadoDispensa         = ESTADO_INACTIVO;
+EstadoDispensa estadoRetornoDesatasco = ESTADO_INACTIVO;
+
+// Control de peso y flujo
+float pesoInicial         = 0.0;
+float pesoObjetivo        = 0.0;
+float ultimoPesoAvance    = 0.0;
+float pesoAnteriorRapido  = 0.0;
+float pesoUltimoDesatasco = 0.0;
+String origenDispensa     = "Manual";
+
+// Temporizadores de dispensa
+unsigned long inicioDispensa        = 0;
+unsigned long tiempoUltimoAvance    = 0;
+unsigned long marcaTiempoFase       = 0;
+unsigned long duracionPulsoActual   = PULSO_MEDIO_MS;
+unsigned long duracionReversaActual = REVERSA_BASE_MS;
+
+int  pulsosSinAvance    = 0;
+int  intentosDesatasco  = 0;
+int  lecturasCortePulso = 0;
+bool veniaDePulsoFino   = false;
+
+// Control de compuertas y RFID
+bool tapaAbierta                          = false;
+bool tagAutorizadoPresente                = false;
+bool tagNoAutorizadoPresente              = false;
+unsigned long ultimaLecturaRFID           = 0;
+unsigned long ultimaDeteccionAutorizada   = 0;
+unsigned long ultimaDeteccionNoAutorizada = 0;
+
+// Temporizadores de Firebase
+unsigned long ultimoChequeoManual   = 0;
+unsigned long ultimoChequeoHorarios = 0;
+unsigned long ultimoEnvioPeso       = 0;
+String ultimoMinutoDispensado       = "";
+
+// ==========================================
+// 4. FUNCIONES DE FIREBASE Y RELOJ NTP
+// ==========================================
+String leerDatoGET(String ruta) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  HTTPClient http;
+  http.begin(firebaseUrl + ruta);
+  int httpCode = http.GET();
+  String payload = (httpCode > 0) ? http.getString() : "";
+  http.end();
+  return payload;
 }
 
-// ---------- ALIMENTACION (no bloqueante) ----------
-
-void startVoeren() {
-  if (feedState != FEED_IDLE) return;
-  duur = constrain(duur, 1, 10);
-
-  mijnServo.attach(SERVO_PIN, 300, 2400);      // rango ampliado
-  mijnServo.writeMicroseconds(SERVO_FEED_US);  // GIRA (al otro lado)
-  feedTijd  = millis();
-  feedState = FEED_VOORUIT;
-  setKleur(0, 0, 1);
+void enviarDatoPUT(String ruta, String valorJson) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(firebaseUrl + ruta);
+  http.addHeader("Content-Type", "application/json");
+  http.PUT(valorJson);
+  http.end();
 }
 
-void updateVoeren() {
-  if (feedState == FEED_IDLE) return;
-
-  if (millis() - feedTijd >= (uint32_t)duur * 1000) {
-    mijnServo.detach();   // corta señal -> PARA
-    feedState = FEED_IDLE;
-    setKleur(1, 0, 1);
-  }
+void enviarDatoPOST(String ruta, String valorJson) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(firebaseUrl + ruta);
+  http.addHeader("Content-Type", "application/json");
+  http.POST(valorJson);
+  http.end();
 }
 
-// ---------- BOTON DE RESET (no bloqueante) ----------
-
-void checkResetKnop() {
-  bool ingedrukt = (digitalRead(RESET_KNOP) == LOW);
-  uint32_t nu = millis();
-
-  if (!ingedrukt) {
-    knopIngedrukt = false;
-    return;
-  }
-
-  if (!knopIngedrukt) {
-    knopIngedrukt = true;
-    knopTijd = nu;
-    setKleur(1, 1, 0);
-    return;
-  }
-
-  if (!resetGedaan && (nu - knopTijd) >= 5000) {
-    resetGedaan = true;
-    setKleur(0, 1, 1);
-    Serial.println("RESET: borrando configuracion y credenciales WiFi...");
-    delay(50);
-
-    prefs.begin("settings", false);
-    prefs.clear();
-    prefs.end();
-
-    wm.resetSettings();
-    delay(100);
-    Serial.println("Reiniciando...");
-    ESP.restart();
-  }
-}
-
-// ---------- HORARIO ----------
-
-void checkVoerTijd() {
-  static uint32_t laatsteCheck = 0;
-  if (millis() - laatsteCheck < 1000) return;
-  laatsteCheck = millis();
-
+String obtenerHoraMinuto() {
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo, 100)) return;
+  if (!getLocalTime(&timeinfo)) return "";
+  char buffer[6];
+  strftime(buffer, sizeof(buffer), "%H:%M", &timeinfo);
+  return String(buffer);
+}
 
-  int huidig = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  if (huidig == laatsteMinuut) return;
-  laatsteMinuut = huidig;
+String obtenerFechaCompleta() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return "2026-11-24 00:00:00";
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
 
-  for (int i = 0; i < aantalMomenten; i++) {
-    if ((voerUur[i] * 60 + voerMin[i]) == huidig) {
-      Serial.println("Hora de alimentar!");
-      startVoeren();
+// ==========================================
+// 5. FUNCIONES DE COMPUERTAS Y RFID / NFC
+// ==========================================
+void abrirCompuertas() {
+  if (tapaAbierta) return;
+  servoTapaR.write(ANGULO_ABIERTO_R);
+  servoTapaL.write(ANGULO_ABIERTO_L);
+  tapaAbierta = true;
+  Serial.println(">> Compuertas ABIERTAS (R y L).");
+}
+
+void cerrarCompuertas() {
+  if (!tapaAbierta) return;
+  servoTapaR.write(ANGULO_CERRADO_R);
+  servoTapaL.write(ANGULO_CERRADO_L);
+  tapaAbierta = false;
+  Serial.println(">> Compuertas CERRADAS (R y L).");
+}
+
+void inicializarCompuertasCerradas() {
+  servoTapaR.write(ANGULO_CERRADO_R);
+  servoTapaL.write(ANGULO_CERRADO_L);
+  tapaAbierta = false;
+}
+
+bool detectarTarjeta() {
+  byte bufferATQA[2];
+  byte bufferSize = sizeof(bufferATQA);
+
+  rfid.PCD_WriteRegister(MFRC522::TxModeReg, 0x00);
+  rfid.PCD_WriteRegister(MFRC522::RxModeReg, 0x00);
+  rfid.PCD_WriteRegister(MFRC522::ModWidthReg, 0x26);
+
+  MFRC522::StatusCode status = rfid.PICC_WakeupA(bufferATQA, &bufferSize);
+  if (status != MFRC522::STATUS_OK && status != MFRC522::STATUS_COLLISION) {
+    return false;
+  }
+  return rfid.PICC_ReadCardSerial();
+}
+
+bool esTagAutorizado() {
+  if (rfid.uid.size != UID_AUTORIZADO_LEN) return false;
+  for (byte i = 0; i < UID_AUTORIZADO_LEN; i++) {
+    if (rfid.uid.uidByte[i] != UID_AUTORIZADO[i]) return false;
+  }
+  return true;
+}
+
+void imprimirUID() {
+  Serial.print("UID:");
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    Serial.print(rfid.uid.uidByte[i] < 0x10 ? " 0" : " ");
+    Serial.print(rfid.uid.uidByte[i], HEX);
+  }
+  Serial.println();
+}
+
+// Prototipo adelantado para que el módulo RFID pueda abortar una dispensa
+void detenerServo(const char* motivo, bool cerrarInmediato = false, bool esAlertaTolva = false, bool registrarLog = true);
+
+void actualizarCompuertas(unsigned long ahora) {
+  if (tagAutorizadoPresente && (ahora - ultimaDeteccionAutorizada >= TIEMPO_CIERRE_MS)) {
+    tagAutorizadoPresente = false;
+    Serial.println(">> Tag autorizado alejado.");
+  }
+
+  if (tagNoAutorizadoPresente && (ahora - ultimaDeteccionNoAutorizada >= TIEMPO_CIERRE_MS)) {
+    tagNoAutorizadoPresente = false;
+    Serial.println(">> Tag no autorizado alejado. Bloqueo liberado.");
+  }
+
+  bool debeEstarAbierta = !tagNoAutorizadoPresente &&
+                          (tagAutorizadoPresente || estadoDispensa != ESTADO_INACTIVO);
+
+  if (debeEstarAbierta && !tapaAbierta) {
+    abrirCompuertas();
+  } else if (!debeEstarAbierta && tapaAbierta) {
+    cerrarCompuertas();
+  }
+}
+
+void actualizarRFID() {
+  unsigned long ahora = millis();
+
+  if (ahora - ultimaLecturaRFID >= INTERVALO_LECTURA_RFID_MS) {
+    ultimaLecturaRFID = ahora;
+
+    if (detectarTarjeta()) {
+      if (esTagAutorizado()) {
+        ultimaDeteccionAutorizada = ahora;
+        bool esNuevaVisita = !tagAutorizadoPresente;
+
+        tagAutorizadoPresente = true;
+        tagNoAutorizadoPresente = false;
+
+        if (esNuevaVisita) {
+          imprimirUID();
+          Serial.println(">> NFC AUTORIZADO -> Acceso permitido.");
+          abrirCompuertas();
+
+          // Registrar acceso NFC en Firebase
+          String fecha = obtenerFechaCompleta();
+          String logJson = "{\"tipo\":\"acceso_nfc\",\"detalle\":\"Tapa abierta - Gato detectado\",\"timestamp\":\"" + fecha + "\"}";
+          enviarDatoPOST("/logs.json", logJson);
+          ultimaDeteccionAutorizada = millis(); // Reiniciar contador tras HTTP
+        }
+      } else {
+        ultimaDeteccionNoAutorizada = ahora;
+        if (!tagNoAutorizadoPresente) {
+          imprimirUID();
+          Serial.println("!! NFC NO AUTORIZADO -> Compuertas y dispensa BLOQUEADAS.");
+        }
+        tagNoAutorizadoPresente = true;
+        tagAutorizadoPresente = false;
+
+        if (estadoDispensa != ESTADO_INACTIVO) {
+          detenerServo("SEGURIDAD: Tag NFC no autorizado detectado", true, false, false);
+        }
+      }
+
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+    }
+  }
+
+  actualizarCompuertas(millis());
+}
+
+// ==========================================
+// 6. FUNCIONES AUXILIARES DE BALANZA Y MOTOR
+// ==========================================
+float aplicarZonaMuerta(float valor, float umbral = ZONA_MUERTA_PLATO) {
+  return (fabs(valor) < umbral) ? 0.0f : valor;
+}
+
+float leerPeso(int muestras) {
+  return aplicarZonaMuerta(balanza.get_units(muestras), ZONA_MUERTA_PLATO);
+}
+
+float leerCrudoMediana3() {
+  float a = balanza.get_units(1);
+  float b = balanza.get_units(1);
+  float c = balanza.get_units(1);
+
+  if (a > b) { float tmp = a; a = b; b = tmp; }
+  if (b > c) { float tmp = b; b = c; c = tmp; }
+  if (a > b) { float tmp = a; a = b; b = tmp; }
+  return b;
+}
+
+float leerPesoPlato() {
+  float peso = aplicarZonaMuerta(leerCrudoMediana3(), ZONA_MUERTA_PLATO);
+  return (peso > 0.0f) ? peso : 0.0f;
+}
+
+void arrancarMotorDispensador(int pulsoUs) {
+  servoDispensador.attach(SERVO_DISPENSADOR_PIN, 300, 2500);
+  servoDispensador.writeMicroseconds(pulsoUs);
+}
+
+unsigned long calcularDuracionPulso(float faltante, int sinAvance) {
+  unsigned long base;
+  if (faltante > 7.0f)      base = PULSO_MUY_LARGO_MS;
+  else if (faltante > 3.5f) base = PULSO_LARGO_MS;
+  else if (faltante > 1.5f) base = PULSO_MEDIO_MS;
+  else                      base = PULSO_CORTO_MS;
+
+  unsigned long total = base + (unsigned long)sinAvance * EXTRA_POR_FALLO_MS;
+  return (total > PULSO_MAX_MS) ? PULSO_MAX_MS : total;
+}
+
+unsigned long calcularEmpujeRecuperacion(unsigned long reversaMs) {
+  unsigned long empuje = reversaMs + EXTRA_EMPUJE_RECUP_MS;
+  return (empuje > MAX_EMPUJE_RECUP_MS) ? MAX_EMPUJE_RECUP_MS : empuje;
+}
+
+void pasarAEspera(bool desdePulso, unsigned long ahora) {
+  servoDispensador.detach();
+  estadoDispensa = ESTADO_ESPERA;
+  veniaDePulsoFino = desdePulso;
+  marcaTiempoFase = ahora;
+  lecturasCortePulso = 0;
+}
+
+void iniciarPulsoFino(unsigned long duracionMs, unsigned long ahora) {
+  duracionPulsoActual = duracionMs;
+  estadoDispensa = ESTADO_PULSO;
+  veniaDePulsoFino = true;
+  marcaTiempoFase = ahora;
+  lecturasCortePulso = 0;
+  arrancarMotorDispensador(SERVO_FEED_US);
+}
+
+void iniciarPreReversa(unsigned long ahora) {
+  pesoInicial = leerCrudoMediana3();
+  ultimoPesoAvance = 0.0;
+  pesoAnteriorRapido = 0.0;
+  pesoUltimoDesatasco = 0.0;
+  tiempoUltimoAvance = ahora;
+  marcaTiempoFase = ahora;
+
+  estadoDispensa = ESTADO_PRE_REVERSA;
+  arrancarMotorDispensador(SERVO_REV_US);
+  Serial.printf("   -> Compuertas listas. Pre-reversa de arranque (%lu ms)...\n", DURACION_PRE_REVERSA_MS);
+}
+
+void iniciarFaseAdelante(float faltante, unsigned long reversaPreviaMs, unsigned long ahora) {
+  if (faltante > MARGEN_FRENADO_G) {
+    estadoDispensa = ESTADO_RAPIDO;
+    veniaDePulsoFino = false;
+    arrancarMotorDispensador(SERVO_FEED_US);
+    Serial.printf("   -> Iniciando fase rapida (corte previo a %.1f g)...\n", pesoObjetivo - MARGEN_FRENADO_G);
+  } else {
+    unsigned long pulsoInicial = (reversaPreviaMs > 0)
+                                 ? calcularEmpujeRecuperacion(reversaPreviaMs)
+                                 : calcularDuracionPulso(faltante, 0);
+    Serial.printf("   -> Iniciando pulsos finos (empuje inicial %lu ms)...\n", pulsoInicial);
+    iniciarPulsoFino(pulsoInicial, ahora);
+  }
+}
+
+bool registrarAvance(float pesoAgregado, float minAvance, unsigned long ahora) {
+  if (pesoAgregado < ultimoPesoAvance + minAvance) return false;
+
+  ultimoPesoAvance = pesoAgregado;
+  tiempoUltimoAvance = ahora;
+
+  if (intentosDesatasco > 0 && (pesoAgregado >= pesoUltimoDesatasco + AVANCE_RESET_DESATASCO_G)) {
+    intentosDesatasco = 0;
+  }
+  return true;
+}
+
+// ==========================================
+// 7. CONTROL DE DISPENSA, DESATASCO Y FIREBASE
+// ==========================================
+void detenerServo(const char* motivo, bool cerrarInmediato, bool esAlertaTolva, bool registrarLog) {
+  servoDispensador.detach();
+  estadoDispensa = ESTADO_INACTIVO;
+  Serial.printf(">> DETENIDO: %s\n", motivo);
+
+  if (cerrarInmediato) {
+    cerrarCompuertas();
+  }
+
+  delay(650);
+  float pesoAgregado = 0.0f;
+  float pesoTotalLimpio = 0.0f;
+
+  if (balanza.is_ready()) {
+    float pesoFinalCrudo = leerCrudoMediana3();
+    pesoAgregado = aplicarZonaMuerta(pesoFinalCrudo - pesoInicial, ZONA_MUERTA_AVANCE);
+    pesoTotalLimpio = aplicarZonaMuerta(pesoFinalCrudo, ZONA_MUERTA_PLATO);
+    Serial.printf("   Agregado real: %.1f g | Total en plato: %.1f g\n\n", pesoAgregado, pesoTotalLimpio);
+
+    enviarDatoPUT("/dispositivo/peso_actual_plato.json", String((int)round(pesoTotalLimpio)));
+  }
+
+  if (!tagAutorizadoPresente) {
+    cerrarCompuertas();
+  }
+
+  // Actualizar estado de tolva y registro histórico en Firebase
+  if (esAlertaTolva) {
+    enviarDatoPUT("/dispositivo/tolva_baja.json", "true");
+  } else if (registrarLog) {
+    enviarDatoPUT("/dispositivo/tolva_baja.json", "false");
+    String fecha = obtenerFechaCompleta();
+    String detalle = String((int)round(pesoAgregado)) + "g servidos (" + origenDispensa + ")";
+    String logJson = "{\"tipo\":\"dispensacion\",\"detalle\":\"" + detalle + "\",\"timestamp\":\"" + fecha + "\"}";
+    enviarDatoPOST("/logs.json", logJson);
+  }
+}
+
+void iniciarDesatasco(EstadoDispensa estadoRetorno, const char* origen) {
+  servoDispensador.detach();
+
+  if (intentosDesatasco >= MAX_INTENTOS_DESATASCO) {
+    detenerServo("SEGURIDAD: Atasco persistente o tolva vacia", false, true, false);
+    return;
+  }
+
+  intentosDesatasco++;
+  pesoUltimoDesatasco = ultimoPesoAvance;
+  estadoRetornoDesatasco = estadoRetorno;
+  duracionReversaActual = REVERSA_BASE_MS + (unsigned long)(intentosDesatasco - 1) * INCREMENTO_REVERSA_MS;
+  estadoDispensa = ESTADO_DESATASCO_FRENO;
+  marcaTiempoFase = millis();
+
+  Serial.printf("   !! POSIBLE ATASCO en %s -> Desatasco (%d/%d, rev %lu ms)...\n",
+                origen, intentosDesatasco, MAX_INTENTOS_DESATASCO, duracionReversaActual);
+}
+
+void iniciarDispensa(float gramosPorServir, String origen) {
+  if (gramosPorServir <= 0.0f || estadoDispensa != ESTADO_INACTIVO) return;
+
+  if (tagNoAutorizadoPresente) {
+    Serial.println("!! DISPENSA BLOQUEADA: Tag NFC no autorizado presente.\n");
+    cerrarCompuertas();
+    return;
+  }
+
+  pesoObjetivo = gramosPorServir;
+  origenDispensa = origen;
+  pulsosSinAvance = 0;
+  intentosDesatasco = 0;
+  lecturasCortePulso = 0;
+  veniaDePulsoFino = false;
+
+  unsigned long ahora = millis();
+  inicioDispensa = ahora;
+  tiempoUltimoAvance = ahora;
+  marcaTiempoFase = ahora;
+
+  Serial.printf(">> DISPENSANDO +%.1f g [%s]...\n", pesoObjetivo, origen.c_str());
+
+  if (!tapaAbierta) {
+    abrirCompuertas();
+    estadoDispensa = ESTADO_ABRIENDO_COMPUERTA;
+  } else {
+    iniciarPreReversa(ahora);
+  }
+}
+
+void actualizarDispensa() {
+  if (estadoDispensa == ESTADO_INACTIVO) return;
+
+  unsigned long ahora = millis();
+
+  if (ahora - inicioDispensa >= TIMEOUT_GLOBAL_MS) {
+    detenerServo("SEGURIDAD: Timeout global alcanzado", false, true, false);
+    return;
+  }
+
+  switch (estadoDispensa) {
+    case ESTADO_ABRIENDO_COMPUERTA:
+      if (ahora - marcaTiempoFase >= MARGEN_APERTURA_COMPUERTA) {
+        if (!balanza.is_ready()) return;
+        iniciarPreReversa(millis());
+      }
+      break;
+
+    case ESTADO_PRE_REVERSA:
+      if (ahora - marcaTiempoFase >= DURACION_PRE_REVERSA_MS) {
+        servoDispensador.detach();
+        estadoDispensa = ESTADO_PRE_PAUSA;
+        marcaTiempoFase = ahora;
+      }
+      break;
+
+    case ESTADO_PRE_PAUSA:
+      if (ahora - marcaTiempoFase >= PAUSA_PRE_ARRANQUE_MS) {
+        if (!balanza.is_ready()) return;
+
+        float pesoAgregado = leerCrudoMediana3() - pesoInicial;
+        if (pesoAgregado >= (pesoObjetivo - TOLERANCIA_FINAL_G)) {
+          detenerServo("Peso objetivo alcanzado tras pre-reversa");
+          return;
+        }
+        if (pesoAgregado > 0.0f) {
+          ultimoPesoAvance = pesoAgregado;
+          pesoAnteriorRapido = pesoAgregado;
+        }
+
+        unsigned long instante = millis();
+        tiempoUltimoAvance = instante;
+        iniciarFaseAdelante(pesoObjetivo - pesoAgregado, DURACION_PRE_REVERSA_MS, instante);
+      }
+      break;
+
+    case ESTADO_RAPIDO:
+      if (balanza.is_ready()) {
+        float pesoAgregado = balanza.get_units(1) - pesoInicial;
+        float delta = pesoAgregado - pesoAnteriorRapido;
+        pesoAnteriorRapido = pesoAgregado;
+
+        Serial.printf("[Rapido] %+.1f / %.1f g\n",
+                      aplicarZonaMuerta(pesoAgregado, ZONA_MUERTA_AVANCE), pesoObjetivo);
+        registrarAvance(pesoAgregado, MIN_AVANCE_RAPIDO_G, ahora);
+
+        float avanceEstimado = constrain(delta, 0.0f, 4.0f);
+        float pesoProyectado = (pesoAgregado > 3.0f) ? (pesoAgregado + avanceEstimado) : pesoAgregado;
+
+        if (pesoProyectado >= (pesoObjetivo - MARGEN_FRENADO_G)) {
+          pasarAEspera(false, ahora);
+          tiempoUltimoAvance = ahora;
+          return;
+        }
+      }
+
+      {
+        unsigned long limiteSinFlujo = (intentosDesatasco == 0 && ultimoPesoAvance < MIN_AVANCE_RAPIDO_G)
+                                       ? TIMEOUT_ARRANQUE_MS
+                                       : TIMEOUT_SIN_FLUJO_MS;
+        if (ahora - tiempoUltimoAvance >= limiteSinFlujo) {
+          iniciarDesatasco(ESTADO_RAPIDO, "fase rapida");
+        }
+      }
+      break;
+
+    case ESTADO_PULSO:
+      if (duracionPulsoActual >= 600 && balanza.is_ready()) {
+        float pesoVivo = balanza.get_units(1) - pesoInicial;
+        if (pesoVivo >= (pesoObjetivo - TOLERANCIA_FINAL_G)) {
+          lecturasCortePulso++;
+          if (lecturasCortePulso >= 2) {
+            pasarAEspera(true, ahora);
+            return;
+          }
+        } else {
+          lecturasCortePulso = 0;
+        }
+      }
+
+      if (ahora - marcaTiempoFase >= duracionPulsoActual) {
+        pasarAEspera(true, ahora);
+      }
+      break;
+
+    case ESTADO_ESPERA:
+      if (ahora - marcaTiempoFase >= PAUSA_ASENTAMIENTO_MS) {
+        if (!balanza.is_ready()) {
+          if (ahora - tiempoUltimoAvance >= TIMEOUT_SIN_FLUJO_MS) {
+            detenerServo("SEGURIDAD: HX711 sin respuesta en fase fina", false, false, false);
+          }
+          return;
+        }
+
+        float pesoAgregado = leerCrudoMediana3() - pesoInicial;
+        Serial.printf("[Fino]   %+.1f / %.1f g\n",
+                      aplicarZonaMuerta(pesoAgregado, ZONA_MUERTA_AVANCE), pesoObjetivo);
+
+        if (pesoAgregado >= (pesoObjetivo - TOLERANCIA_FINAL_G)) {
+          detenerServo("Peso objetivo alcanzado");
+          return;
+        }
+
+        if (registrarAvance(pesoAgregado, MIN_AVANCE_FINO_G, ahora)) {
+          pulsosSinAvance = 0;
+        } else if (veniaDePulsoFino) {
+          pulsosSinAvance++;
+          if (pulsosSinAvance >= MAX_PULSOS_SIN_AVANCE) {
+            iniciarDesatasco(ESTADO_PULSO, "fase fina");
+            return;
+          }
+        }
+
+        float faltante = pesoObjetivo - pesoAgregado;
+        iniciarPulsoFino(calcularDuracionPulso(faltante, pulsosSinAvance), millis());
+      }
+      break;
+
+    case ESTADO_DESATASCO_FRENO:
+      if (ahora - marcaTiempoFase >= PAUSA_PRE_REVERSA_MS) {
+        arrancarMotorDispensador(SERVO_REV_US);
+        estadoDispensa = ESTADO_DESATASCO_REV;
+        marcaTiempoFase = ahora;
+      }
+      break;
+
+    case ESTADO_DESATASCO_REV:
+      if (ahora - marcaTiempoFase >= duracionReversaActual) {
+        servoDispensador.detach();
+        estadoDispensa = ESTADO_DESATASCO_PAUSA;
+        marcaTiempoFase = ahora;
+      }
+      break;
+
+    case ESTADO_DESATASCO_PAUSA:
+      if (ahora - marcaTiempoFase >= PAUSA_POST_REVERSA_MS) {
+        float pesoAgregado = ultimoPesoAvance;
+        if (balanza.is_ready()) {
+          pesoAgregado = leerCrudoMediana3() - pesoInicial;
+          if (pesoAgregado >= (pesoObjetivo - TOLERANCIA_FINAL_G)) {
+            detenerServo("Peso objetivo alcanzado tras desatasco");
+            return;
+          }
+          if (pesoAgregado > ultimoPesoAvance) {
+            ultimoPesoAvance = pesoAgregado;
+          }
+        }
+
+        unsigned long instante = millis();
+        tiempoUltimoAvance = instante;
+        pulsosSinAvance = 0;
+        pesoAnteriorRapido = pesoAgregado;
+
+        float faltante = pesoObjetivo - pesoAgregado;
+        if (estadoRetornoDesatasco == ESTADO_RAPIDO && faltante > MARGEN_FRENADO_G) {
+          iniciarFaseAdelante(faltante, 0, instante);
+        } else {
+          float faltanteAcotado = (faltante < MARGEN_FRENADO_G) ? faltante : MARGEN_FRENADO_G;
+          iniciarFaseAdelante(faltanteAcotado, duracionReversaActual, instante);
+        }
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ==========================================
+// 8. CONSULTAS DE RUTINAS Y ÓRDENES DESDE FIREBASE
+// ==========================================
+void revisarOrdenDispensar() {
+  String estado = leerDatoGET("/dispositivo/dispensar_ahora.json");
+  if (estado == "true") {
+    enviarDatoPUT("/dispositivo/dispensar_ahora.json", "false");
+    iniciarDispensa(50.0, "App Manual");
+  }
+}
+
+void comprobarHorariosFirebase() {
+  String horaActual = obtenerHoraMinuto();
+  if (horaActual == "" || horaActual == ultimoMinutoDispensado) return;
+
+  String jsonRutinas = leerDatoGET("/rutinas.json");
+  if (jsonRutinas == "" || jsonRutinas == "null") return;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, jsonRutinas)) return;
+
+  for (JsonPair kv : doc.as<JsonObject>()) {
+    JsonObject rutina = kv.value().as<JsonObject>();
+    bool activa = rutina["activa"] | false;
+    String horaProgramada = rutina["hora"] | "";
+    float gramosMeta = rutina["gramos"] | 0.0;
+
+    if (activa && horaProgramada == horaActual && gramosMeta > 0.0f) {
+      ultimoMinutoDispensado = horaActual;
+
+      // Calcula sobrante en plato antes de servir
+      float pesoEnPlato = balanza.is_ready() ? leerPesoPlato() : 0.0f;
+      float gramosFaltantes = gramosMeta - pesoEnPlato;
+
+      Serial.printf("\n=== RUTINA %s | Meta: %.1f g | En plato: %.1f g ===\n",
+                    horaActual.c_str(), gramosMeta, pesoEnPlato);
+
+      if (gramosFaltantes <= TOLERANCIA_FINAL_G) {
+        Serial.println("    El plato ya cumple con la racion. No se dispensa.\n");
+      } else {
+        iniciarDispensa(gramosFaltantes, "Rutina " + horaActual);
+      }
       break;
     }
   }
 }
 
-// ---------- PAGINA WEB ----------
-
-String pagina() {
-  struct tm timeinfo;
-  bool conHora = getLocalTime(&timeinfo, 50);
-  String tijd = "--:--";
-  if (conHora) {
-    String h = "", m = "";
-    if (timeinfo.tm_hour < 10) h += "0";
-    h += String(timeinfo.tm_hour);
-    if (timeinfo.tm_min < 10) m += "0";
-    m += String(timeinfo.tm_min);
-    tijd = h + ":" + m;
-  }
-
-  String html = "";
-  html += "<!DOCTYPE html>\n";
-  html += "<html>\n";
-  html += "<head>\n";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>\n";
-  html += "<style>\n";
-  html += "body {font-family:sans-serif;background:#0f172a;color:white;text-align:center;}\n";
-  html += ".card {background:#1e293b;padding:20px;margin:10px;border-radius:15px;}\n";
-  html += "button {padding:15px;border-radius:10px;border:none;background:#38bdf8;}\n";
-  html += ".row {display:flex;gap:5px;margin:5px;}\n";
-  html += "input {flex:1;padding:10px;border-radius:10px;border:none;}\n";
-  html += "</style>\n";
-  html += "</head>\n";
-  html += "<body>\n";
-  html += "<h2>SmartCat Feeder</h2>\n";
-  html += "<p>ESP32: <b id='espClock'>" + tijd + "</b> &nbsp; Movil: <span id='clock'>--:--</span></p>\n";
-  html += "<p>IP: <b id='ip'>--</b> &nbsp; <span id='status'>conectando...</span></p>\n";
-  html += "<div class='card'>\n";
-  html += "speed : <span id='speedVal'>0</span>%<br>\n";
-  html += "<input type='range' id='speed' min='0' max='100'>\n";
-  html += "<br><br>\n";
-  html += "duration : <span id='timeVal'>0</span> sec<br>\n";
-  html += "<input type='range' id='time' min='1' max='10'>\n";
-  html += "</div>\n";
-  html += "<div class='card'>\n";
-  html += "feed moments\n";
-  html += "<div id='momenten'></div>\n";
-  html += "<button onclick='addMoment()'> + </button>\n";
-  html += "</div>\n";
-  html += "<div class='card'>\n";
-  html += "<button onclick='feedNow()'> feed </button>\n";
-  html += "</div>\n";
-  html += "<script>\n";
-
-  html += "let count = " + String(aantalMomenten) + ";\n";
-
-  html += "function saveAll(){\n";
-  html += "for(let i=0;i<count;i++){\n";
-  html += "let u=document.getElementById('u'+i);\n";
-  html += "let m=document.getElementById('m'+i);\n";
-  html += "if(u&&m){window['u'+i]=u.value;window['m'+i]=m.value;}\n";
-  html += "}\n";
-  html += "}\n";
-
-  html += "function renderMomenten(){\n";
-  html += "let c=document.getElementById('momenten');\n";
-  html += "c.innerHTML='';\n";
-  html += "for(let i=0;i<count;i++){\n";
-  html += "let d=document.createElement('div');\n";
-  html += "d.className='row';\n";
-  html += "d.innerHTML=`\n";
-  html += "<input type='number' id='u${i}' min='0' max='23' value='${window['u'+i] !== undefined ? window['u'+i] : 0}' onchange='saveMoment(${i})'>\n";
-  html += "<input type='number' id='m${i}' min='0' max='59' value='${window['m'+i] !== undefined ? window['m'+i] : 0}' onchange='saveMoment(${i})'>\n";
-  html += "<button onclick='removeMoment(${i})'> X </button>\n";
-  html += "`;\n";
-  html += "c.appendChild(d);\n";
-  html += "}\n";
-  html += "}\n";
-
-  html += "function addMoment(){\n";
-  html += "saveAll();\n";
-  html += "if(count>=5)return;\n";
-  html += "window['u'+count]=12;\n";
-  html += "window['m'+count]=0;\n";
-  html += "count++;\n";
-  html += "renderMomenten();\n";
-  html += "sendData();\n";
-  html += "}\n";
-
-  html += "function removeMoment(i){\n";
-  html += "saveAll();\n";
-  html += "for(let x=i;x<count-1;x++){\n";
-  html += "window['u'+x]=window['u'+(x+1)];\n";
-  html += "window['m'+x]=window['m'+(x+1)];\n";
-  html += "}\n";
-  html += "count--;\n";
-  html += "renderMomenten();\n";
-  html += "setTimeout(sendData,50);\n";
-  html += "}\n";
-
-  html += "function saveMoment(i){\n";
-  html += "let u=document.getElementById('u'+i);\n";
-  html += "let m=document.getElementById('m'+i);\n";
-  html += "if(u&&m){window['u'+i]=u.value;window['m'+i]=m.value;sendData();}\n";
-  html += "}\n";
-
-  html += "function sendData(){\n";
-  html += "let url='/update?';\n";
-  html += "url+='speed='+speed.value;\n";
-  html += "url+='&time='+time.value;\n";
-  html += "url+='&count='+count;\n";
-  html += "for(let i=0;i<count;i++){\n";
-  html += "url+='&u'+i+'='+window['u'+i];\n";
-  html += "url+='&m'+i+'='+window['m'+i];\n";
-  html += "}\n";
-  html += "fetch(url);\n";
-  html += "}\n";
-
-  html += "function feedNow(){fetch('/api/feed').then(()=>{document.getElementById('status').innerText='Alimentando...';});}\n";
-
-  html += "let speed=document.getElementById('speed');\n";
-  html += "let time=document.getElementById('time');\n";
-  html += "let speedVal=document.getElementById('speedVal');\n";
-  html += "let timeVal=document.getElementById('timeVal');\n";
-  html += "function updateLabels(){speedVal.innerText=speed.value;timeVal.innerText=time.value;}\n";
-  html += "speed.oninput = function(){ updateLabels(); }\n";
-  html += "speed.onchange = function(){ updateLabels(); sendData(); }\n";
-  html += "time.oninput = function(){ updateLabels(); }\n";
-  html += "time.onchange = function(){ updateLabels(); sendData(); }\n";
-
-  html += "window.onload=function(){\n";
-  html += "speed.value=" + String(snelheid) + ";\n";
-  html += "time.value=" + String(duur) + ";\n";
-  html += "updateLabels();\n";
-
-  for (int i = 0; i < aantalMomenten; i++) {
-    html += "window['u" + String(i) + "']=" + String(voerUur[i]) + ";";
-    html += "window['m" + String(i) + "']=" + String(voerMin[i]) + ";";
-  }
-
-  html += "\n";
-  html += "updateClock();\n";
-  html += "renderMomenten();\n";
-  html += "pollState();\n";
-  html += "}\n";
-
-  html += "function updateClock(){\n";
-  html += "let now=new Date();\n";
-  html += "let h=now.getHours().toString().padStart(2,'0');\n";
-  html += "let m=now.getMinutes().toString().padStart(2,'0');\n";
-  html += "document.getElementById('clock').innerText=h+':'+m;\n";
-  html += "}\n";
-
-  html += "async function pollState(){\n";
-  html += "try{\n";
-  html += "const r=await fetch('/api/state',{cache:'no-store'});\n";
-  html += "const s=await r.json();\n";
-  html += "document.getElementById('espClock').innerText=s.hora;\n";
-  html += "document.getElementById('ip').innerText=s.ip;\n";
-  html += "document.getElementById('status').innerText=s.alimentando ? 'Alimentando...' : ('Proximo: '+s.proximo);\n";
-  html += "}catch(e){\n";
-  html += "document.getElementById('status').innerText='sin conexion con el ESP32';\n";
-  html += "}\n";
-  html += "}\n";
-
-  html += "setInterval(updateClock,1000);\n";
-  html += "setInterval(pollState,2000);\n";
-  html += "</script>\n";
-  html += "</body>\n";
-  html += "</html>\n";
-
-  return html;
-}
-
-void handleRoot() { server.send(200, "text/html", pagina()); }
-
-void handleUpdate() {
-  bool gewijzigd = false;
-
-  if (server.hasArg("speed")) {
-    int v = constrain(server.arg("speed").toInt(), 0, 100);
-    if (v != snelheid) { snelheid = v; gewijzigd = true; }
-  }
-  if (server.hasArg("time")) {
-    int v = constrain(server.arg("time").toInt(), 1, 10);
-    if (v != duur) { duur = v; gewijzigd = true; }
-  }
-  if (server.hasArg("count")) {
-    int v = constrain(server.arg("count").toInt(), 1, MAX_MOMENTEN);
-    if (v != aantalMomenten) { aantalMomenten = v; gewijzigd = true; }
-  }
-
-  int nieuweUur[MAX_MOMENTEN];
-  int nieuweMin[MAX_MOMENTEN];
-  for (int i = 0; i < MAX_MOMENTEN; i++) { nieuweUur[i] = voerUur[i]; nieuweMin[i] = voerMin[i]; }
-
-  for (int i = 0; i < aantalMomenten; i++) {
-    if (server.hasArg("u" + String(i))) {
-      int v = constrain(server.arg("u" + String(i)).toInt(), 0, 23);
-      if (v != nieuweUur[i]) { nieuweUur[i] = v; gewijzigd = true; }
-    }
-    if (server.hasArg("m" + String(i))) {
-      int v = constrain(server.arg("m" + String(i)).toInt(), 0, 59);
-      if (v != nieuweMin[i]) { nieuweMin[i] = v; gewijzigd = true; }
-    }
-  }
-
-  if (gewijzigd) {
-    for (int i = 0; i < aantalMomenten; i++) { voerUur[i] = nieuweUur[i]; voerMin[i] = nieuweMin[i]; }
-
-    prefs.begin("settings", false);
-    prefs.putInt("speed", snelheid);
-    prefs.putInt("duur", duur);
-    prefs.putInt("aantal", aantalMomenten);
-    for (int i = 0; i < aantalMomenten; i++) {
-      prefs.putInt(("u" + String(i)).c_str(), voerUur[i]);
-      prefs.putInt(("m" + String(i)).c_str(), voerMin[i]);
-    }
-    prefs.end();
-
-    Serial.printf("Guardado -> velocidad=%d duracion=%d horarios=", snelheid, duur);
-    for (int i = 0; i < aantalMomenten; i++) Serial.printf("%02d:%02d ", voerUur[i], voerMin[i]);
-    Serial.println();
-  }
-
-  server.send(200, "text/plain", "OK");
-}
-
-void handleFeed() {
-  startVoeren();
-  server.send(200, "text/plain", "OK");
-}
-
-// ---------- API JSON ----------
-
-String dosDigitos(int v) {
-  String s = "";
-  if (v < 10) s += "0";
-  s += String(v);
-  return s;
-}
-
-String estadoJson() {
-  struct tm timeinfo;
-  bool conHora = getLocalTime(&timeinfo, 50);
-
-  String hora = "--:--";
-  int ahora = -1;
-  if (conHora) {
-    hora = dosDigitos(timeinfo.tm_hour) + ":" + dosDigitos(timeinfo.tm_min);
-    ahora = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  }
-
-  String proximo = "--";
-  if (ahora >= 0) {
-    int mejorDiff = 24 * 60 + 1;
-    for (int i = 0; i < aantalMomenten; i++) {
-      int t = voerUur[i] * 60 + voerMin[i];
-      int diff = t - ahora;
-      if (diff < 0) diff += 24 * 60;
-      if (diff < mejorDiff) { mejorDiff = diff; proximo = dosDigitos(voerUur[i]) + ":" + dosDigitos(voerMin[i]); }
-    }
-  }
-
-  JsonDocument doc;
-  doc["hora"]        = hora;
-  doc["ip"]          = WiFi.localIP().toString();
-  doc["host"]        = String("kattenvoer.local");
-  doc["alimentando"] = (feedState != FEED_IDLE);
-  doc["snelheid"]    = snelheid;
-  doc["duur"]        = duur;
-  doc["momentos"]    = aantalMomenten;
-  doc["proximo"]     = proximo;
-  doc["rssi"]        = (int)WiFi.RSSI();
-  doc["uptime"]      = (int)(millis() / 1000);
-
-  JsonArray horarios = doc["horarios"].to<JsonArray>();
-  for (int i = 0; i < aantalMomenten; i++) {
-    JsonObject h = horarios.add<JsonObject>();
-    h["h"] = voerUur[i];
-    h["m"] = voerMin[i];
-  }
-
-  String out;
-  serializeJson(doc, out);
-  return out;
-}
-
-void handleApiState() {
-  server.send(200, "application/json", estadoJson());
-}
-
-void handleApiFeed() {
-  startVoeren();
-  server.send(200, "application/json", estadoJson());
-}
-
-// ---------- SETUP / LOOP ----------
-
-void cp(const String& msg) {
-  Serial.println(msg);
-  Serial.flush();
-}
-
+// ==========================================
+// 9. SETUP Y LOOP PRINCIPAL
+// ==========================================
 void setup() {
   Serial.begin(115200);
   delay(300);
-#if DEBUG_CORE
-  Serial.setDebugOutput(true);
-#endif
 
-  if (arranqueNum < 0 || arranqueNum > 1000) arranqueNum = 0;
-  arranqueNum++;
-  bool modoSeguro = (arranqueNum > MAX_ARRANQUES);
+  // Inicializar SPI y lector RFID
+  SPI.begin();
+  rfid.PCD_Init();
 
-  Serial.println();
-  cp("[1] setup - arranque");
-  Serial.print("    arranque nro: "); Serial.println(arranqueNum); Serial.flush();
-  Serial.print("    motivo del reinicio previo: ");
-  switch (esp_reset_reason()) {
-    case ESP_RST_POWERON:   Serial.println("POWERON (encendido/reset de pin)"); break;
-    case ESP_RST_EXT:       Serial.println("EXT (pin RESET)"); break;
-    case ESP_RST_SW:        Serial.println("SW (ESP.restart)"); break;
-    case ESP_RST_PANIC:     Serial.println("PANIC (error de codigo)"); break;
-    case ESP_RST_INT_WDT:   Serial.println("INT_WDT (watchdog de un task: WiFi o flash)"); break;
-    case ESP_RST_TASK_WDT:  Serial.println("TASK_WDT (watchdog de un task)"); break;
-    case ESP_RST_WDT:       Serial.println("WDT"); break;
-    case ESP_RST_BROWNOUT:  Serial.println("BROWNOUT (falta de alimentacion)"); break;
-    default:                Serial.println("otro"); break;
+  // Asignar 3 timers PWM dedicados para los 3 servos
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+
+  // Configurar servo dispensador detenido
+  servoDispensador.setPeriodHertz(50);
+  servoDispensador.attach(SERVO_DISPENSADOR_PIN, 300, 2500);
+  servoDispensador.detach();
+
+  // Configurar servos de compuertas cerrados
+  servoTapaR.setPeriodHertz(50);
+  servoTapaL.setPeriodHertz(50);
+  servoTapaR.attach(SERVO_TAPA_R_PIN, 500, 2400);
+  servoTapaL.attach(SERVO_TAPA_L_PIN, 500, 2400);
+  inicializarCompuertasCerradas();
+
+  // Inicializar balanza HX711 y hacer tara
+  balanza.begin(DT_PIN, SCK_PIN);
+  Serial.println("No pongas peso en la balanza (solo el plato vacio)...");
+  delay(2000);
+  balanza.set_scale(factorCalibracion);
+  balanza.tare(20);
+
+  // Conectar a Wi-Fi
+  Serial.print("Conectando a Wi-Fi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
-  Serial.flush();
-  if (modoSeguro) cp("    !! MODO SEGURO: demasiados reinicios, se desactiva el WiFi");
+  Serial.println("\n¡Wi-Fi conectado!");
 
-  pinMode(RESET_KNOP, INPUT_PULLUP);
-  cp("[2a] pin boton ok");
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
-  cp("[2b] pines led ok");
-  setKleur(1, 1, 0);
-  cp("[2c] leds ok");
+  // Sincronizar reloj por internet y reportar estado inicial a Firebase
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  enviarDatoPUT("/dispositivo/estado_wifi.json", "true");
+  enviarDatoPUT("/dispositivo/peso_actual_plato.json", "0");
+  enviarDatoPUT("/dispositivo/tolva_baja.json", "false");
 
-  mijnServo.setPeriodHertz(50);
-  mijnServo.attach(SERVO_PIN, 300, 2400);
-  mijnServo.detach();                 // sin señal = servo quieto al arrancar
-  cp("[3] servo ok (pin 18)");
-
-  prefs.begin("settings", true);
-  snelheid = constrain(prefs.getInt("speed", 30), 0, 100);
-  duur    = constrain(prefs.getInt("duur", 2), 1, 10);
-  aantalMomenten = constrain(prefs.getInt("aantal", 2), 1, MAX_MOMENTEN);
-  for (int i = 0; i < aantalMomenten; i++) {
-    voerUur[i] = constrain(prefs.getInt(("u" + String(i)).c_str(), 8), 0, 23);
-    voerMin[i] = constrain(prefs.getInt(("m" + String(i)).c_str(), 0), 0, 59);
-  }
-  prefs.end();
-  cp("[4] ajustes leidos de la NVS");
-
-  setenv("TZ", "CET-1CEST,M3.5.0/02,M10.5.0/03", 1);
-  tzset();
-  cp("[5] zona horaria ok");
-
-#if SIN_WIFI
-  cp("[6] MODO DIAGNOSTICO: se salta el WiFi por completo");
-#else
-  bool conectado = false;
-
-  if (modoSeguro) {
-    cp("[6] MODO SEGURO: se salta el auto-connect, se levanta el portal");
-  } else {
-    cp("[6a] WiFi: modo STA, connectando con la red guardada...");
-    WiFi.setSleep(false);
-    WiFi.setAutoReconnect(true);
-    wm.setEnableConfigPortal(false);
-    wm.setConnectTimeout(20);
-
-    conectado = wm.autoConnect(apName);
-    cp(conectado ? "[6b] WiFi CONECTADO" : "[6c] no hay ninguna red guardada");
-  }
-
-  if (!conectado) {
-    cp("[6d] levantando el portal (AP CatFeeder)...");
-    wm.setEnableConfigPortal(true);
-    wm.setConfigPortalBlocking(false);
-
-    wm.setSaveConfigCallback([]() {
-      guardarYReiniciar = true;
-    });
-
-    wm.startConfigPortal(apName);
-    cp("[6e] portal activo");
-  }
-
-  if (conectado) {
-    Serial.print("    IP: "); Serial.println(WiFi.localIP().toString()); Serial.flush();
-  }
-
-  cp("[7] iniciando NTP...");
-  configTime(0, 0, ntpServer);
-  cp("[8] NTP configurado (sincroniza en segundo plano)");
-
-  Serial.println();
-  Serial.println("==========================================");
-  Serial.println("  CAT FEEDER - listo");
-  if (conectado) {
-    Serial.print("  Panel (esta misma red): http://");
-    Serial.println(WiFi.localIP().toString());
-    Serial.println("  Panel (por nombre)   : http://kattenvoer.local");
-    Serial.println("  -> En el movil: que este en ESTA misma WiFi");
-  } else {
-    Serial.println("  1) Conecta el movil a la AP 'CatFeeder'");
-    Serial.println("  2) Se abrira el portal: elige tu red y contrasena");
-    Serial.println("  3) El ESP32 se reinicia solo al guardar");
-  }
-  Serial.println("==========================================");
-  Serial.println();
-  Serial.flush();
-#endif
-
-  setKleur(1, 0, 1);
-
-  server.on("/", handleRoot);
-  server.on("/update", handleUpdate);
-  server.on("/feed", handleFeed);
-  server.on("/api/state", handleApiState);
-  server.on("/api/feed", handleApiFeed);
-
-  cp("[10] setup terminado");
-
-  arranqueNum = 0;
+  Serial.println("\n=== COMEDERO COMPLETO LISTO (HARDWARE AVANZADO + FIREBASE) ===\n");
 }
 
 void loop() {
-  wm.process();
+  // 1. RFID y máquina de estados de dispensa siempre activos
+  actualizarRFID();
+  actualizarDispensa();
 
-  if (guardarYReiniciar) {
-    guardarYReiniciar = false;
-    cp("[*] red guardada, reiniciando...");
-    delay(1500);
-    ESP.restart();
-  }
+  // 2. Solo consultar Firebase cuando el dispensador está en reposo
+  if (estadoDispensa == ESTADO_INACTIVO) {
+    unsigned long ahora = millis();
 
-  if (!serverActivo && WiFi.status() == WL_CONNECTED) {
-    server.begin();
-    serverActivo = true;
-    Serial.println("Servidor web iniciado");
-    Serial.println("Abre en el movil: http://" + WiFi.localIP().toString());
-    if (!mdnsActivo) {
-      MDNS.begin("kattenvoer");
-      MDNS.addService("http", "tcp", 80);
-      mdnsActivo = true;
+    if (ahora - ultimoChequeoManual >= 3000) {
+      ultimoChequeoManual = ahora;
+      revisarOrdenDispensar();
+    }
+
+    if (ahora - ultimoChequeoHorarios >= 10000) {
+      ultimoChequeoHorarios = ahora;
+      comprobarHorariosFirebase();
+    }
+
+    if (ahora - ultimoEnvioPeso >= 5000) {
+      ultimoEnvioPeso = ahora;
+      if (balanza.is_ready()) {
+        float peso = leerPeso(5);
+        Serial.printf("[%s] Peso: %.1f g | Compuertas: %s\n",
+                      obtenerHoraMinuto().c_str(), peso, tapaAbierta ? "ABIERTAS" : "CERRADAS");
+        enviarDatoPUT("/dispositivo/peso_actual_plato.json", String((int)round(peso)));
+      }
     }
   }
-
-  if (serverActivo && WiFi.status() != WL_CONNECTED) {
-    if (wifiCaidoTijd == 0) {
-      wifiCaidoTijd = millis();
-      Serial.println("WiFi caido, reintentando...");
-      WiFi.reconnect();
-    } else if (millis() - wifiCaidoTijd > 60000) {
-      Serial.println("WiFi no vuelve -> reiniciando");
-      ESP.restart();
-    }
-  } else {
-    wifiCaidoTijd = 0;
-  }
-
-  if (serverActivo) server.handleClient();
-
-  updateVoeren();
-  checkVoerTijd();
-  checkResetKnop();
 }
