@@ -11,9 +11,9 @@
 // ==========================================
 // 1. CONFIGURACIÓN WI-FI, FIREBASE Y RELOJ
 // ==========================================
-const char* ssid = "TU_NOMBRE_WIFI";
-const char* password = "TU_CONTRASEÑA_WIFI";
-const String firebaseUrl = "https://tu-proyecto-default-rtdb.firebaseio.com"; // SIN / al final
+const char* ssid = "Tallertest";
+const char* password = "12345678";
+const String firebaseUrl = "https://test-9d590-default-rtdb.firebaseio.com"; // SIN / al final
 
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = -6 * 3600; // GMT-6 El Salvador
@@ -27,7 +27,6 @@ const int daylightOffset_sec = 0;
 #define SCK_PIN               17
 
 // --- Servo Dispensador (360° rotación continua) ---
-// GPIO 25 (libre de conflicto con SPI SCK = 18)
 #define SERVO_DISPENSADOR_PIN 25
 #define SERVO_FEED_US         400
 #define SERVO_REV_US          2500
@@ -49,9 +48,9 @@ const unsigned long MARGEN_APERTURA_COMPUERTA  = 1000;
 const unsigned long TIEMPO_CIERRE_MS           = 1500;
 const unsigned long INTERVALO_LECTURA_RFID_MS  = 100;
 
-// --- UID del tag autorizado (REEMPLAZA por el UID real del collar) ---
+// --- UID del tag autorizado ---
 const byte UID_AUTORIZADO_LEN                  = 4;
-const byte UID_AUTORIZADO[UID_AUTORIZADO_LEN]  = { 0xDE, 0xAD, 0xBE, 0xEF };
+const byte UID_AUTORIZADO[UID_AUTORIZADO_LEN]  = { 0x21, 0x12, 0xD5, 0x1D };
 
 // --- Protecciones de seguridad y detección de atasco ---
 const unsigned long TIMEOUT_GLOBAL_MS          = 60000;
@@ -121,6 +120,12 @@ float ultimoPesoAvance    = 0.0;
 float pesoAnteriorRapido  = 0.0;
 float pesoUltimoDesatasco = 0.0;
 String origenDispensa     = "Manual";
+bool pesoInicialTomado    = false;
+
+// Variables para pausar y reanudar ante tag no autorizado
+bool dispensaPausadaPorIntruso = false;
+float gramosPendientes         = 0.0;
+String origenPendiente         = "";
 
 // Temporizadores de dispensa
 unsigned long inicioDispensa        = 0;
@@ -147,6 +152,11 @@ unsigned long ultimoChequeoManual   = 0;
 unsigned long ultimoChequeoHorarios = 0;
 unsigned long ultimoEnvioPeso       = 0;
 String ultimoMinutoDispensado       = "";
+
+// Prototipos adelantados
+void iniciarDispensa(float gramosPorServir, String origen);
+void pausarDispensaPorIntruso();
+void detenerServo(const char* motivo, bool cerrarInmediato = false, bool esAlertaTolva = false, bool registrarLog = true);
 
 // ==========================================
 // 4. FUNCIONES DE FIREBASE Y RELOJ NTP
@@ -189,7 +199,7 @@ String obtenerHoraMinuto() {
 
 String obtenerFechaCompleta() {
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return "2026-11-24 00:00:00";
+  if (!getLocalTime(&timeinfo)) return "2026-11-25 00:00:00";
   char buffer[25];
   strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buffer);
@@ -252,9 +262,6 @@ void imprimirUID() {
   Serial.println();
 }
 
-// Prototipo adelantado para que el módulo RFID pueda abortar una dispensa
-void detenerServo(const char* motivo, bool cerrarInmediato = false, bool esAlertaTolva = false, bool registrarLog = true);
-
 void actualizarCompuertas(unsigned long ahora) {
   if (tagAutorizadoPresente && (ahora - ultimaDeteccionAutorizada >= TIEMPO_CIERRE_MS)) {
     tagAutorizadoPresente = false;
@@ -264,6 +271,17 @@ void actualizarCompuertas(unsigned long ahora) {
   if (tagNoAutorizadoPresente && (ahora - ultimaDeteccionNoAutorizada >= TIEMPO_CIERRE_MS)) {
     tagNoAutorizadoPresente = false;
     Serial.println(">> Tag no autorizado alejado. Bloqueo liberado.");
+
+    // Reanudar automáticamente si había una dispensa pausada
+    if (dispensaPausadaPorIntruso) {
+      dispensaPausadaPorIntruso = false;
+      if (gramosPendientes > TOLERANCIA_FINAL_G) {
+        Serial.printf(">> Reanudando dispensa pausada (+%.1f g restantes)...\n", gramosPendientes);
+        iniciarDispensa(gramosPendientes, origenPendiente);
+      } else {
+        Serial.println(">> La racion ya se habia completado antes de la pausa.");
+      }
+    }
   }
 
   bool debeEstarAbierta = !tagNoAutorizadoPresente &&
@@ -295,11 +313,10 @@ void actualizarRFID() {
           Serial.println(">> NFC AUTORIZADO -> Acceso permitido.");
           abrirCompuertas();
 
-          // Registrar acceso NFC en Firebase
           String fecha = obtenerFechaCompleta();
           String logJson = "{\"tipo\":\"acceso_nfc\",\"detalle\":\"Tapa abierta - Gato detectado\",\"timestamp\":\"" + fecha + "\"}";
           enviarDatoPOST("/logs.json", logJson);
-          ultimaDeteccionAutorizada = millis(); // Reiniciar contador tras HTTP
+          ultimaDeteccionAutorizada = millis();
         }
       } else {
         ultimaDeteccionNoAutorizada = ahora;
@@ -310,8 +327,9 @@ void actualizarRFID() {
         tagNoAutorizadoPresente = true;
         tagAutorizadoPresente = false;
 
+        // En lugar de cancelar, pausamos para retomar cuando se aleje
         if (estadoDispensa != ESTADO_INACTIVO) {
-          detenerServo("SEGURIDAD: Tag NFC no autorizado detectado", true, false, false);
+          pausarDispensaPorIntruso();
         }
       }
 
@@ -390,6 +408,7 @@ void iniciarPulsoFino(unsigned long duracionMs, unsigned long ahora) {
 
 void iniciarPreReversa(unsigned long ahora) {
   pesoInicial = leerCrudoMediana3();
+  pesoInicialTomado = true;
   ultimoPesoAvance = 0.0;
   pesoAnteriorRapido = 0.0;
   pesoUltimoDesatasco = 0.0;
@@ -429,11 +448,32 @@ bool registrarAvance(float pesoAgregado, float minAvance, unsigned long ahora) {
 }
 
 // ==========================================
-// 7. CONTROL DE DISPENSA, DESATASCO Y FIREBASE
+// 7. CONTROL DE DISPENSA, PAUSA, DESATASCO Y FIREBASE
 // ==========================================
+void pausarDispensaPorIntruso() {
+  servoDispensador.detach();
+  estadoDispensa = ESTADO_INACTIVO;
+  cerrarCompuertas();
+
+  float servidoHastaAhora = 0.0f;
+  if (pesoInicialTomado && balanza.is_ready()) {
+    float lectura = leerCrudoMediana3() - pesoInicial;
+    if (lectura > 0.0f) servidoHastaAhora = lectura;
+  }
+
+  gramosPendientes = pesoObjetivo - servidoHastaAhora;
+  if (gramosPendientes < 0.0f) gramosPendientes = 0.0f;
+  origenPendiente = origenDispensa;
+  dispensaPausadaPorIntruso = true;
+
+  Serial.printf(">> PAUSADO POR SEGURIDAD: Servido %.1f g | Pendiente %.1f g (se reanudara al alejarse)\n",
+                servidoHastaAhora, gramosPendientes);
+}
+
 void detenerServo(const char* motivo, bool cerrarInmediato, bool esAlertaTolva, bool registrarLog) {
   servoDispensador.detach();
   estadoDispensa = ESTADO_INACTIVO;
+  pesoInicialTomado = false;
   Serial.printf(">> DETENIDO: %s\n", motivo);
 
   if (cerrarInmediato) {
@@ -457,7 +497,6 @@ void detenerServo(const char* motivo, bool cerrarInmediato, bool esAlertaTolva, 
     cerrarCompuertas();
   }
 
-  // Actualizar estado de tolva y registro histórico en Firebase
   if (esAlertaTolva) {
     enviarDatoPUT("/dispositivo/tolva_baja.json", "true");
   } else if (registrarLog) {
@@ -492,13 +531,17 @@ void iniciarDispensa(float gramosPorServir, String origen) {
   if (gramosPorServir <= 0.0f || estadoDispensa != ESTADO_INACTIVO) return;
 
   if (tagNoAutorizadoPresente) {
-    Serial.println("!! DISPENSA BLOQUEADA: Tag NFC no autorizado presente.\n");
+    Serial.println("!! DISPENSA EN ESPERA: Tag NFC no autorizado presente. Se servira al alejarse.\n");
+    gramosPendientes = gramosPorServir;
+    origenPendiente = origen;
+    dispensaPausadaPorIntruso = true;
     cerrarCompuertas();
     return;
   }
 
   pesoObjetivo = gramosPorServir;
   origenDispensa = origen;
+  pesoInicialTomado = false;
   pulsosSinAvance = 0;
   intentosDesatasco = 0;
   lecturasCortePulso = 0;
@@ -727,7 +770,6 @@ void comprobarHorariosFirebase() {
     if (activa && horaProgramada == horaActual && gramosMeta > 0.0f) {
       ultimoMinutoDispensado = horaActual;
 
-      // Calcula sobrante en plato antes de servir
       float pesoEnPlato = balanza.is_ready() ? leerPesoPlato() : 0.0f;
       float gramosFaltantes = gramosMeta - pesoEnPlato;
 
@@ -751,35 +793,29 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // Inicializar SPI y lector RFID
   SPI.begin();
   rfid.PCD_Init();
 
-  // Asignar 3 timers PWM dedicados para los 3 servos
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
 
-  // Configurar servo dispensador detenido
   servoDispensador.setPeriodHertz(50);
   servoDispensador.attach(SERVO_DISPENSADOR_PIN, 300, 2500);
   servoDispensador.detach();
 
-  // Configurar servos de compuertas cerrados
   servoTapaR.setPeriodHertz(50);
   servoTapaL.setPeriodHertz(50);
   servoTapaR.attach(SERVO_TAPA_R_PIN, 500, 2400);
   servoTapaL.attach(SERVO_TAPA_L_PIN, 500, 2400);
   inicializarCompuertasCerradas();
 
-  // Inicializar balanza HX711 y hacer tara
   balanza.begin(DT_PIN, SCK_PIN);
   Serial.println("No pongas peso en la balanza (solo el plato vacio)...");
   delay(2000);
   balanza.set_scale(factorCalibracion);
   balanza.tare(20);
 
-  // Conectar a Wi-Fi
   Serial.print("Conectando a Wi-Fi");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
@@ -788,7 +824,6 @@ void setup() {
   }
   Serial.println("\n¡Wi-Fi conectado!");
 
-  // Sincronizar reloj por internet y reportar estado inicial a Firebase
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   enviarDatoPUT("/dispositivo/estado_wifi.json", "true");
   enviarDatoPUT("/dispositivo/peso_actual_plato.json", "0");
@@ -798,12 +833,11 @@ void setup() {
 }
 
 void loop() {
-  // 1. RFID y máquina de estados de dispensa siempre activos
   actualizarRFID();
   actualizarDispensa();
 
-  // 2. Solo consultar Firebase cuando el dispensador está en reposo
-  if (estadoDispensa == ESTADO_INACTIVO) {
+  // Solo consultar Firebase cuando está en reposo y no hay una pausa pendiente
+  if (estadoDispensa == ESTADO_INACTIVO && !dispensaPausadaPorIntruso) {
     unsigned long ahora = millis();
 
     if (ahora - ultimoChequeoManual >= 3000) {
