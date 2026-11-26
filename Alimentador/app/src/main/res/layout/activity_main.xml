@@ -2,153 +2,156 @@
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#F5F7FA"
-    android:padding="16dp">
+    android:background="#FAFAFA"
+    android:fillViewport="true">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:orientation="vertical">
+        android:orientation="vertical"
+        android:padding="16dp">
 
+        <!-- TÍTULO PRINCIPAL -->
         <TextView
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Alimentador Felino"
-            android:textSize="24sp"
+            android:text="Comedero Inteligente"
+            android:textSize="22sp"
             android:textStyle="bold"
-            android:textColor="#1A1C1E"
-            android:layout_marginBottom="16dp" />
+            android:textColor="#1565C0"
+            android:layout_marginBottom="12dp" />
 
-        <!-- 1. Panel de Control (Dashboard) -->
+        <!-- PANEL DE ESTADO DEL DISPOSITIVO -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:background="#FFFFFF"
-            android:padding="16dp"
+            android:padding="14dp"
             android:elevation="2dp"
             android:layout_marginBottom="16dp">
 
             <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="PANEL DE CONTROL"
-                android:textSize="12sp"
-                android:textStyle="bold"
-                android:textColor="#6C757D" />
-
-            <TextView
                 android:id="@+id/tvEstadoWifi"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Estado: Conectando..."
-                android:textSize="16sp"
+                android:text="Estado: Desconectado"
+                android:textSize="15sp"
                 android:textStyle="bold"
-                android:textColor="#2E7D32"
-                android:layout_marginTop="8dp" />
+                android:layout_marginBottom="4dp" />
 
             <TextView
                 android:id="@+id/tvPesoPlato"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Peso actual en plato: 0g"
-                android:textSize="18sp"
-                android:textColor="#1A1C1E"
-                android:layout_marginTop="6dp" />
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:textColor="#212121"
+                android:layout_marginBottom="4dp" />
 
             <TextView
                 android:id="@+id/tvEstadoTolva"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Tolva: Nivel normal"
                 android:textSize="14sp"
-                android:textColor="#555555"
-                android:layout_marginTop="4dp" />
+                android:layout_marginBottom="12dp" />
 
             <Button
                 android:id="@+id/btnDispensarAhora"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Dispensar porción ahora"
-                android:layout_marginTop="14dp" />
+                android:text="Dispensar comida ahora" />
         </LinearLayout>
 
-        <!-- 2. Rutinas Nutricionales -->
+        <!-- SECCIÓN DE RUTINAS PROGRAMADAS -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:background="#FFFFFF"
-            android:padding="16dp"
-            android:elevation="2dp"
-            android:layout_marginBottom="16dp">
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="8dp">
 
             <TextView
-                android:layout_width="wrap_content"
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:text="RUTINAS PROGRAMADAS"
-                android:textSize="12sp"
+                android:layout_weight="1"
+                android:text="Rutinas programadas"
+                android:textSize="18sp"
                 android:textStyle="bold"
-                android:textColor="#6C757D" />
+                android:textColor="#212121" />
 
             <Button
                 android:id="@+id/btnNuevaRutina"
-                android:layout_width="match_parent"
+                android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="+ Agregar horario y gramos"
-                android:layout_marginTop="10dp" />
-
-            <TextView
-                android:id="@+id/tvSinRutinas"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="No hay rutinas programadas todavía."
-                android:textSize="15sp"
-                android:textColor="#666666"
-                android:layout_marginTop="12dp" />
-
-            <LinearLayout
-                android:id="@+id/llContenedorRutinas"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:layout_marginTop="4dp" />
+                android:text="+ Nueva" />
         </LinearLayout>
 
-        <!-- 3. Registro Histórico (Logs) -->
+        <TextView
+            android:id="@+id/tvSinRutinas"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="No hay rutinas programadas."
+            android:textColor="#757575"
+            android:layout_marginBottom="8dp" />
+
         <LinearLayout
+            android:id="@+id/llContenedorRutinas"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:background="#FFFFFF"
-            android:padding="16dp"
-            android:elevation="2dp"
-            android:layout_marginBottom="16dp">
+            android:layout_marginBottom="16dp" />
 
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="REGISTRO HISTÓRICO (LOGS)"
-                android:textSize="12sp"
-                android:textStyle="bold"
-                android:textColor="#6C757D" />
+        <!-- SECCIÓN NUEVA: DASHBOARD DE CONSUMO -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Dashboard de consumo"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="#212121"
+            android:layout_marginBottom="6dp" />
 
-            <TextView
-                android:id="@+id/tvSinLogs"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="Aún no hay eventos registrados."
-                android:textSize="15sp"
-                android:textColor="#666666"
-                android:layout_marginTop="10dp" />
+        <TextView
+            android:id="@+id/tvSinHistorial"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Aún no hay rutinas registradas."
+            android:textColor="#757575"
+            android:layout_marginBottom="8dp" />
 
-            <LinearLayout
-                android:id="@+id/llContenedorLogs"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:layout_marginTop="4dp" />
-        </LinearLayout>
+        <LinearLayout
+            android:id="@+id/llContenedorHistorial"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:layout_marginBottom="16dp" />
+
+        <!-- SECCIÓN DE LOGS -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Registro de eventos"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="#212121"
+            android:layout_marginBottom="6dp" />
+
+        <TextView
+            android:id="@+id/tvSinLogs"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Aún no hay eventos registrados."
+            android:textColor="#757575"
+            android:layout_marginBottom="8dp" />
+
+        <LinearLayout
+            android:id="@+id/llContenedorLogs"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical" />
 
     </LinearLayout>
 </ScrollView>

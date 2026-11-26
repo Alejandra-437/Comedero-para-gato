@@ -88,6 +88,12 @@ const unsigned long EXTRA_POR_FALLO_MS         = 120;
 const unsigned long PULSO_MAX_MS               = 850;
 const unsigned long PAUSA_ASENTAMIENTO_MS      = 650;
 
+// Seguimiento de la sesión de comida actual para el Dashboard
+String idSesionActual     = "";
+float gramosComidosSesion = 0.0f;
+float pesoAntesDeComer    = 0.0f;
+String horaInicioVisita   = "";
+
 // ==========================================
 // 3. OBJETOS Y VARIABLES DE ESTADO
 // ==========================================
@@ -205,6 +211,14 @@ String obtenerFechaCompleta() {
   return String(buffer);
 }
 
+String obtenerIdSesion() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return String(millis());
+  char buffer[25];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d_%H-%M-%S", &timeinfo);
+  return String(buffer);
+}
+
 // ==========================================
 // 5. FUNCIONES DE COMPUERTAS Y RFID / NFC
 // ==========================================
@@ -263,9 +277,22 @@ void imprimirUID() {
 }
 
 void actualizarCompuertas(unsigned long ahora) {
-  if (tagAutorizadoPresente && (ahora - ultimaDeteccionAutorizada >= TIEMPO_CIERRE_MS)) {
+if (tagAutorizadoPresente && (ahora - ultimaDeteccionAutorizada >= TIEMPO_CIERRE_MS)) {
     tagAutorizadoPresente = false;
     Serial.println(">> Tag autorizado alejado.");
+
+    // --- NUEVO: Calcular cuánto comió y actualizar el Dashboard ---
+    if (idSesionActual != "" && balanza.is_ready()) {
+      float pesoDespues = leerPesoPlato();
+      float comido = pesoAntesDeComer - pesoDespues;
+
+      if (comido >= 1.0f) { // Ignora variaciones menores a 1g por ruido
+        gramosComidosSesion += comido;
+        Serial.printf(">> El gato comio %.1f g (Total en rutina: %.1f g)\n", comido, gramosComidosSesion);
+        enviarDatoPUT("/historial_rutinas/" + idSesionActual + "/gramos_comidos.json", String((int)round(gramosComidosSesion)));
+        enviarDatoPUT("/historial_rutinas/" + idSesionActual + "/hora_fue_a_comer.json", "\"" + horaInicioVisita + "\"");
+      }
+    }
   }
 
   if (tagNoAutorizadoPresente && (ahora - ultimaDeteccionNoAutorizada >= TIEMPO_CIERRE_MS)) {
@@ -312,6 +339,10 @@ void actualizarRFID() {
           imprimirUID();
           Serial.println(">> NFC AUTORIZADO -> Acceso permitido.");
           abrirCompuertas();
+
+          // --- NUEVO: Guardar peso y hora al llegar ---
+          pesoAntesDeComer = balanza.is_ready() ? leerPesoPlato() : 0.0f;
+          horaInicioVisita = obtenerHoraMinuto();
 
           String fecha = obtenerFechaCompleta();
           String logJson = "{\"tipo\":\"acceso_nfc\",\"detalle\":\"Tapa abierta - Gato detectado\",\"timestamp\":\"" + fecha + "\"}";
@@ -456,9 +487,18 @@ void pausarDispensaPorIntruso() {
   cerrarCompuertas();
 
   float servidoHastaAhora = 0.0f;
-  if (pesoInicialTomado && balanza.is_ready()) {
-    float lectura = leerCrudoMediana3() - pesoInicial;
-    if (lectura > 0.0f) servidoHastaAhora = lectura;
+
+  if (pesoInicialTomado) {
+    // Respaldo inmediato: usa el último avance válido registrado (ej. 46.5 g)
+    servidoHastaAhora = ultimoPesoAvance;
+
+    // Intenta tomar una lectura fresca (espera máximo 200 ms al HX711)
+    if (balanza.wait_ready_timeout(200)) {
+      float lectura = leerCrudoMediana3() - pesoInicial;
+      if (lectura > 0.0f) {
+        servidoHastaAhora = lectura;
+      }
+    }
   }
 
   gramosPendientes = pesoObjetivo - servidoHastaAhora;
@@ -505,8 +545,19 @@ void detenerServo(const char* motivo, bool cerrarInmediato, bool esAlertaTolva, 
     String detalle = String((int)round(pesoAgregado)) + "g servidos (" + origenDispensa + ")";
     String logJson = "{\"tipo\":\"dispensacion\",\"detalle\":\"" + detalle + "\",\"timestamp\":\"" + fecha + "\"}";
     enviarDatoPOST("/logs.json", logJson);
+    // --- NUEVO: Crear contenedor de rutina en /historial_rutinas ---
+    idSesionActual = obtenerIdSesion();
+    gramosComidosSesion = 0.0f;
+    String horaDisp = obtenerHoraMinuto();
+    String sesionJson = "{\"origen\":\"" + origenDispensa + "\","
+                        "\"hora_dispensado\":\"" + horaDisp + "\","
+                        "\"gramos_servidos\":" + String((int)round(pesoAgregado)) + ","
+                        "\"hora_fue_a_comer\":\"Pendiente\","
+                        "\"gramos_comidos\":0}";
+    enviarDatoPUT("/historial_rutinas/" + idSesionActual + ".json", sesionJson);
   }
-}
+  }
+
 
 void iniciarDesatasco(EstadoDispensa estadoRetorno, const char* origen) {
   servoDispensador.detach();
@@ -746,8 +797,31 @@ void actualizarDispensa() {
 void revisarOrdenDispensar() {
   String estado = leerDatoGET("/dispositivo/dispensar_ahora.json");
   if (estado == "true") {
+    // 1. Apagamos la bandera de inmediato para no repetir
     enviarDatoPUT("/dispositivo/dispensar_ahora.json", "false");
-    iniciarDispensa(50.0, "App Manual");
+
+    // 2. Leemos cuántos gramos pidió el usuario desde la app
+    String gramosStr = leerDatoGET("/dispositivo/gramos_manual.json");
+    float gramosMeta = gramosStr.toFloat();
+
+    if (gramosMeta <= 0.0f) {
+      Serial.println(">> [App Manual] Cantidad invalida o en 0. No se dispensa.");
+      return;
+    }
+
+    // 3. Restamos lo que ya está en el plato
+    float pesoEnPlato = balanza.is_ready() ? leerPesoPlato() : 0.0f;
+    float gramosFaltantes = gramosMeta - pesoEnPlato;
+
+    Serial.printf("\n=== APP MANUAL | Meta: %.1f g | En plato: %.1f g ===\n",
+                  gramosMeta, pesoEnPlato);
+
+    if (gramosFaltantes <= TOLERANCIA_FINAL_G) {
+      Serial.println("    El plato ya cumple con la racion pedida. No se dispensa.\n");
+    } else {
+      Serial.printf("    Sirviendo diferencia: +%.1f g\n", gramosFaltantes);
+      iniciarDispensa(gramosFaltantes, "App Manual");
+    }
   }
 }
 

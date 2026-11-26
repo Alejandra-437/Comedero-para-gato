@@ -2,6 +2,8 @@ package com.example.alimentador
 
 import android.app.TimePickerDialog
 import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
 import android.text.InputType
 import android.view.LayoutInflater
@@ -15,16 +17,21 @@ import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.firebase.database.*
-import java.text.SimpleDateFormat
 import java.util.Calendar
-import java.util.Date
-import java.util.Locale
 
 data class Rutina(
     val id: String = "",
     val hora: String = "08:00",
     val gramos: Int = 0,
     val activa: Boolean = true
+)
+
+data class SesionRutina(
+    val origen: String = "",
+    val hora_dispensado: String = "",
+    val gramos_servidos: Int = 0,
+    val hora_fue_a_comer: String = "Pendiente",
+    val gramos_comidos: Int = 0
 )
 
 data class LogEvento(
@@ -41,6 +48,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvEstadoTolva: TextView
     private lateinit var tvSinRutinas: TextView
     private lateinit var llContenedorRutinas: LinearLayout
+    private lateinit var tvSinHistorial: TextView
+    private lateinit var llContenedorHistorial: LinearLayout
     private lateinit var tvSinLogs: TextView
     private lateinit var llContenedorLogs: LinearLayout
 
@@ -55,6 +64,8 @@ class MainActivity : AppCompatActivity() {
         tvEstadoTolva = findViewById(R.id.tvEstadoTolva)
         tvSinRutinas = findViewById(R.id.tvSinRutinas)
         llContenedorRutinas = findViewById(R.id.llContenedorRutinas)
+        tvSinHistorial = findViewById(R.id.tvSinHistorial)
+        llContenedorHistorial = findViewById(R.id.llContenedorHistorial)
         tvSinLogs = findViewById(R.id.tvSinLogs)
         llContenedorLogs = findViewById(R.id.llContenedorLogs)
 
@@ -63,17 +74,34 @@ class MainActivity : AppCompatActivity() {
 
         escucharEstadoDispositivo()
         escucharRutinas()
+        escucharHistorialRutinas()
         escucharLogs()
 
         btnDispensarAhora.setOnClickListener {
-            database.child("dispositivo").child("dispensar_ahora").setValue(true)
+            val inputGramos = EditText(this).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER
+                hint = "Ej: 50"
+            }
 
-            // Guardamos un evento en logs para confirmar el registro inmediato
-            val fechaActual = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date())
-            val logManual = LogEvento("dispensacion", "Dispensación manual desde la app", fechaActual)
-            database.child("logs").push().setValue(logManual)
-
-            Toast.makeText(this, "Orden de dispensación enviada", Toast.LENGTH_SHORT).show()
+            AlertDialog.Builder(this)
+                .setTitle("Dispensar comida")
+                .setMessage("¿Cuántos gramos totales deseas en el plato?")
+                .setView(inputGramos)
+                .setPositiveButton("Dispensar") { _, _ ->
+                    val gramos = inputGramos.text.toString().toIntOrNull()
+                    if (gramos != null && gramos > 0) {
+                        val updates = mapOf<String, Any>(
+                            "gramos_manual" to gramos,
+                            "dispensar_ahora" to true
+                        )
+                        database.child("dispositivo").updateChildren(updates)
+                        Toast.makeText(this, "Orden enviada: completar ${gramos}g", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this, "Ingresa una cantidad válida", Toast.LENGTH_SHORT).show()
+                    }
+                }
+                .setNegativeButton("Cancelar", null)
+                .show()
         }
 
         btnNuevaRutina.setOnClickListener {
@@ -152,8 +180,83 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun escucharHistorialRutinas() {
+        database.child("historial_rutinas").limitToLast(15).addValueEventListener(object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                llContenedorHistorial.removeAllViews()
+
+                if (!snapshot.exists()) {
+                    tvSinHistorial.visibility = View.VISIBLE
+                    return
+                }
+
+                tvSinHistorial.visibility = View.GONE
+
+                val listaSesiones = mutableListOf<SesionRutina>()
+                for (dato in snapshot.children) {
+                    val sesion = dato.getValue(SesionRutina::class.java)
+                    if (sesion != null) listaSesiones.add(sesion)
+                }
+                listaSesiones.reverse() // Más reciente arriba
+
+                for (sesion in listaSesiones) {
+                    val tarjeta = LinearLayout(this@MainActivity).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(32, 24, 32, 24)
+                        background = GradientDrawable().apply {
+                            setColor(Color.parseColor("#F5F5F5"))
+                            cornerRadius = 16f
+                            setStroke(2, Color.parseColor("#E0E0E0"))
+                        }
+                        layoutParams = LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT
+                        ).apply {
+                            setMargins(0, 0, 0, 16)
+                        }
+                    }
+
+                    val tvTitulo = TextView(this@MainActivity).apply {
+                        text = sesion.origen
+                        textSize = 16f
+                        setTypeface(null, Typeface.BOLD)
+                        setTextColor(Color.parseColor("#1565C0"))
+                    }
+
+                    val tvDispensado = TextView(this@MainActivity).apply {
+                        text = "Dispensado: ${sesion.hora_dispensado} (${sesion.gramos_servidos}g servidos)"
+                        textSize = 14f
+                    }
+
+                    val tvHoraComida = TextView(this@MainActivity).apply {
+                        text = "Fue a comer: ${sesion.hora_fue_a_comer}"
+                        textSize = 14f
+                    }
+
+                    val tvComido = TextView(this@MainActivity).apply {
+                        text = "Comió: ${sesion.gramos_comidos}g"
+                        textSize = 14f
+                        setTypeface(null, Typeface.BOLD)
+                        setTextColor(
+                            if (sesion.gramos_comidos > 0) Color.parseColor("#2E7D32")
+                            else Color.parseColor("#757575")
+                        )
+                    }
+
+                    tarjeta.addView(tvTitulo)
+                    tarjeta.addView(tvDispensado)
+                    tarjeta.addView(tvHoraComida)
+                    tarjeta.addView(tvComido)
+
+                    llContenedorHistorial.addView(tarjeta)
+                }
+            }
+
+            override fun onCancelled(error: DatabaseError) {}
+        })
+    }
+
     private fun escucharLogs() {
-        // limitToLast(15) muestra los últimos 15 eventos para no saturar la pantalla
         database.child("logs").limitToLast(15).addValueEventListener(object : ValueEventListener {
             override fun onDataChange(snapshot: DataSnapshot) {
                 llContenedorLogs.removeAllViews()
@@ -166,7 +269,6 @@ class MainActivity : AppCompatActivity() {
                 tvSinLogs.visibility = View.GONE
                 val inflater = LayoutInflater.from(this@MainActivity)
 
-                // Guardamos en lista y la invertimos para ver el evento más reciente arriba
                 val listaLogs = mutableListOf<LogEvento>()
                 for (dato in snapshot.children) {
                     val log = dato.getValue(LogEvento::class.java)
@@ -182,10 +284,10 @@ class MainActivity : AppCompatActivity() {
 
                     if (log.tipo == "acceso_nfc") {
                         tvTipo.text = "Acceso NFC (Gato detectado)"
-                        tvTipo.setTextColor(Color.parseColor("#2E7D32")) // Verde
+                        tvTipo.setTextColor(Color.parseColor("#2E7D32"))
                     } else {
                         tvTipo.text = "Dispensación de alimento"
-                        tvTipo.setTextColor(Color.parseColor("#1565C0")) // Azul
+                        tvTipo.setTextColor(Color.parseColor("#1565C0"))
                     }
 
                     tvDetalle.text = log.detalle
